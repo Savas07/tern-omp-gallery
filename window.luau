@@ -1,13 +1,15 @@
 --!strict
 -- omp-gallery, window half: the "Show omp sessions" command and its status
 -- line button, the gallery's tab at window start, a refresh whenever the
--- gallery gets focus, and the resume links the gallery block opens.
+-- gallery gets focus, and the links the gallery block opens: resume a
+-- session, or start a new one in a folder picked here.
 
 local common = require("./common")
 
 local HOME = tern.getenv("HOME") or ""
 local SESSIONS = HOME .. "/.omp/agent/sessions/"
 local START_TRIES = 20 -- at window start, wait up to 10 s for the host half
+local MAX_FOLDERS = 1000 -- subfolders the folder picker lists
 
 -- The gallery's pane in this window, if it has one.
 local function gallery(cx: WindowCx): number?
@@ -159,6 +161,135 @@ local function resume(cx: WindowCx, fields: { [string]: string }, from: number)
 	end
 end
 
+local function start_omp(cx: WindowCx, dir: string)
+	if cx.layout:new_tab({ cwd = dir, command = "omp" }) == nil then
+		cx:toast("error", "Couldn't start omp", dir)
+	end
+end
+
+local function is_dir(path: string): boolean
+	-- `file/.` doesn't exist, so this is false for files.
+	return path ~= "" and tern.fs.exists(if path == "/" then path else path .. "/.")
+end
+
+local function join(dir: string, name: string): string
+	return if dir == "/" then "/" .. name else dir .. "/" .. name
+end
+
+local function parent(dir: string): string
+	local up = string.match(dir, "^(.*)/[^/]+$")
+	return if up == nil or up == "" then "/" else up
+end
+
+-- A typed path made absolute: `~` is home, relative paths start at `dir`.
+local function resolve(dir: string, typed: string): string
+	local path = string.match(typed, "^%s*(.-)%s*$") or ""
+	if path == "~" or string.sub(path, 1, 2) == "~/" then
+		path = HOME .. string.sub(path, 2)
+	elseif string.sub(path, 1, 1) ~= "/" then
+		path = join(dir, path)
+	end
+	local parts: { string } = {}
+	for part in string.gmatch(path, "[^/]+") do
+		if part == ".." then
+			table.remove(parts)
+		elseif part ~= "." then
+			table.insert(parts, part)
+		end
+	end
+	return "/" .. table.concat(parts, "/")
+end
+
+-- `dir`'s visible subfolders, sorted.
+local function folders(dir: string): { string }
+	local out: { string } = {}
+	local ok, names = pcall(tern.fs.list, dir)
+	if not ok then
+		return out
+	end
+	for _, name in names :: { string } do
+		if string.sub(name, 1, 1) ~= "." and is_dir(join(dir, name)) then
+			table.insert(out, name)
+			if #out >= MAX_FOLDERS then
+				break
+			end
+		end
+	end
+	return out
+end
+
+local browse: (cx: WindowCx, dir: string, recent: { string }) -> ()
+
+local function type_path(cx: WindowCx, dir: string, recent: { string })
+	cx:prompt({
+		value = common.tilde(dir) .. "/",
+		placeholder = "Folder path (~/…, relative to " .. common.tilde(dir) .. ")",
+		icon = "folder-go",
+		action = "go",
+	}):next(function(typed: string?, _err: string?, later: WindowCx?)
+		if typed == nil or later == nil then
+			return
+		end
+		local path = resolve(dir, typed)
+		if is_dir(path) then
+			browse(later, path, recent)
+		else
+			later:toast("error", "Not a folder", common.tilde(path))
+			browse(later, dir, recent)
+		end
+	end)
+end
+
+-- The new session picker: start omp in `dir`, start it in a recent project,
+-- or go to another folder (a subfolder, up, home or a typed path) and pick
+-- again there.
+browse = function(cx: WindowCx, dir: string, recent: { string })
+	local here = common.tilde(dir)
+	local items: { PickItem } = {
+		{ label = "Start omp here", detail = here, icon = "play", group = here, go = "start", path = dir },
+	}
+	if dir ~= "/" then
+		table.insert(items, { label = "..", detail = common.tilde(parent(dir)), icon = "arrow-up", group = here, go = "open", path = parent(dir) })
+	end
+	if dir ~= HOME and HOME ~= "" then
+		table.insert(items, { label = "Home", detail = "~", icon = "folder", group = here, go = "open", path = HOME })
+	end
+	table.insert(items, { label = "Type a path…", icon = "folder-go", group = here, go = "type" })
+	for _, path in recent do
+		if path ~= dir and is_dir(path) then
+			table.insert(items, {
+				label = common.basename(path),
+				detail = common.tilde(path),
+				icon = "app-omp",
+				group = "Start in a recent project",
+				go = "start",
+				path = path,
+			})
+		end
+	end
+	local heading = "Folders in " .. common.basename(here)
+	for _, name in folders(dir) do
+		table.insert(items, { label = name, icon = "folder", group = heading, go = "open", path = join(dir, name) })
+	end
+	cx:pick({
+		items = items,
+		placeholder = "New omp session in " .. here .. " — type to find a folder",
+		icon = "folder-open",
+		action = "choose",
+	}):next(function(item: PickItem?, _err: string?, later: WindowCx?)
+		if item == nil or later == nil then
+			return
+		end
+		if item.go == "start" then
+			start_omp(later, item.path)
+		elseif item.go == "type" then
+			type_path(later, dir, recent)
+		else
+			browse(later, item.path, recent)
+		end
+	end)
+end
+
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	local verb, fields = common.parse(link.url)
 	if verb == nil then
@@ -167,8 +298,19 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	-- Only the gallery block asks, and every window showing it hears the
 	-- request: the window where it has focus acts on it.
 	local from = cx.session:pane(link.pane)
-	if verb == "resume" and from and from.block == common.KIND and cx.session:focused() == link.pane then
-		resume(cx, fields, link.pane)
+	if from and from.block == common.KIND and cx.session:focused() == link.pane then
+		if verb == "resume" then
+			resume(cx, fields, link.pane)
+		elseif verb == "start" and is_dir(fields.cwd or "") then
+			start_omp(cx, fields.cwd)
+		elseif verb == "new" then
+			local recent: { string } = {}
+			for path in string.gmatch(fields.recent or "", "[^\n]+") do
+				table.insert(recent, path)
+			end
+			local cwd = fields.cwd or ""
+			browse(cx, if is_dir(cwd) then cwd else HOME, recent)
+		end
 	end
 	return { handled = true }
 end)

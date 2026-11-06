@@ -10,7 +10,8 @@
 -- new tab), asked for with an `omp-gallery://` link.
 --
 -- Keys: type to search, ←↑↓→ move, Enter resumes in a new tab (⌥Enter: in a
--- split), Tab/⇧Tab cycle the project filter, Esc clears, ⌃R refreshes.
+-- split), ⌃N starts a new session in a folder you pick, Tab/⇧Tab cycle the
+-- project filter, Esc clears, ⌃R refreshes.
 
 local common = require("./common")
 
@@ -30,6 +31,7 @@ local WAKE_MS = 5000 -- a focus refresh this soon after the last scan is skipped
 local PAGE = 24 -- cards per page: whole rows at 1 to 4 columns
 local CARD_CELLS = 44 -- pane width one column of cards needs, in cells
 local MAX_COLUMNS = 4
+local RECENT = 12 -- project folders the new session picker offers
 
 local ALL = "*" -- the project filter's "every project"
 local SEARCH_ID = "main.bar.search"
@@ -194,16 +196,8 @@ local function size_text(n: number): string
 	return string.format("%.1f MB", n / (1024 * 1024))
 end
 
-local function tilde(path: string): string
-	if HOME ~= "" and (path == HOME or string.sub(path, 1, #HOME + 1) == HOME .. "/") then
-		return "~" .. string.sub(path, #HOME + 1)
-	end
-	return path
-end
-
-local function basename(path: string): string
-	return string.match(path, "([^/]+)/*$") or path
-end
+local tilde = common.tilde
+local basename = common.basename
 
 -- At most `chars` characters of `s`, cut on a character boundary.
 local function clip(s: string, chars: number): string
@@ -877,6 +871,26 @@ local function resume(cx: BlockCx, s: Session, how: string)
 	}))
 end
 
+-- Asks the window half for a new omp session in `cwd`, or without one for its
+-- folder picker (at the project filter's folder, else home).
+local function new_session(state: State, cx: BlockCx, cwd: string?)
+	if cwd then
+		cx:open(common.link("start", { cwd = cwd }))
+		return
+	end
+	local recent: { string } = {}
+	for _, p in projects() do
+		if #recent >= RECENT then
+			break
+		end
+		table.insert(recent, p.cwd)
+	end
+	cx:open(common.link("new", {
+		cwd = if state.project ~= ALL then state.project else "",
+		recent = table.concat(recent, "\n"),
+	}))
+end
+
 local function has_mod(ev: UiEvent, mod: string): boolean
 	return type(ev.mods) == "table" and table.find(ev.mods, mod) ~= nil
 end
@@ -898,6 +912,13 @@ local function head_row(): Node
 			wrap = "none",
 			truncate = "end",
 			spans = { ui.span("omp sessions", "title"), ui.span("   " .. meta, "muted") },
+		}),
+		ui.button("New session", {
+			key = "new",
+			icon = "plus",
+			variant = "primary",
+			keys = { "ctrl+n" },
+			actions = { click = "new" },
 		}),
 		ui.button("Refresh", {
 			key = "refresh",
@@ -989,6 +1010,12 @@ local function card_menu(s: Session, held: boolean): { any }
 			icon = "split",
 			keys = { "alt", "enter" },
 			disabled = if held then "omp is already running it" else false,
+		},
+		{
+			id = "here=" .. s.key,
+			label = "New session in this folder",
+			icon = "plus",
+			disabled = if s.cwd == "" then "Unknown folder" else false,
 		},
 		"-",
 		{
@@ -1135,6 +1162,7 @@ local function nothing(state: State): Node
 		title = "No omp sessions yet",
 		text = "Sessions show up here once omp saves one in " .. tilde(ROOT) .. ".",
 	}, {
+		ui.button("New session", { key = "new", icon = "plus", variant = "primary", actions = { click = "new" } }),
 		ui.button("Refresh", { key = "retry", icon = "repeat", actions = { click = "refresh" } }),
 	})
 end
@@ -1144,6 +1172,7 @@ local function legend(): Node
 		{ "←↑↓→", "move" },
 		{ "enter", "resume" },
 		{ "alt+enter", "split" },
+		{ "ctrl+n", "new session" },
 		{ "tab", "project" },
 		{ "esc", "clear" },
 		{ "ctrl+r", "refresh" },
@@ -1242,9 +1271,7 @@ local function key(state: State, k: Key, cx: BlockCx): boolean?
 		elseif name == "w" then
 			set_query(state, drop_word(state.query))
 		elseif name == "n" then
-			return move(state, cx, columns(cx))
-		elseif name == "p" then
-			return move(state, cx, -columns(cx))
+			new_session(state, cx)
 		else
 			return false
 		end
@@ -1313,6 +1340,8 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 		local s = find(if type(ev.value) == "string" then ev.value else nil)
 		if act == "wake" then
 			refresh(false) -- the window half: the gallery got focus
+		elseif act == "new" then
+			new_session(state, cx)
 		elseif act == "refresh" then
 			refresh(true)
 		elseif act == "more" then
@@ -1331,6 +1360,8 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 			resume(cx, s, if act == "split" or has_mod(ev, "alt") then "split" else "tab")
 		elseif act == "folder" then
 			cx:open(s.cwd)
+		elseif act == "here" and s.cwd ~= "" then
+			new_session(state, cx, s.cwd)
 		elseif act == "copyid" then
 			cx:copy(s.id)
 			cx:toast("success", "Copied the session ID", s.id)

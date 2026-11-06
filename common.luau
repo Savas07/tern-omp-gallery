@@ -1,11 +1,13 @@
 --!strict
 -- Shared by both halves: names, the links the gallery block opens for the
--- window half to act on, and shell quoting for the resume command.
+-- window half to act on, path display and shell quoting.
 
 local M = {}
 
 M.KIND = "omp-gallery.gallery"
 M.OPEN = "plugin.omp-gallery.open"
+
+local HOME = tern.getenv("HOME") or ""
 
 -- A block can't reach the window's layout, so it asks with `cx:open` of an
 -- `omp-gallery://<verb>?<field>=<value>&…` link, which the window half's
@@ -56,6 +58,18 @@ end
 -- `s` as one word for sh, bash, zsh and fish.
 function M.quote(s: string): string
 	return "'" .. string.gsub(s, "'", "'\\''") .. "'"
+end
+
+-- `path` with the home folder written as `~`.
+function M.tilde(path: string): string
+	if HOME ~= "" and (path == HOME or string.sub(path, 1, #HOME + 1) == HOME .. "/") then
+		return "~" .. string.sub(path, #HOME + 1)
+	end
+	return path
+end
+
+function M.basename(path: string): string
+	return string.match(path, "([^/]+)/*$") or path
 end
 
 function M.resume_command(path: string): string
