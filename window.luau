@@ -8,7 +8,7 @@
 
 local common = require("./common")
 
-local HOME = tern.getenv("HOME") or ""
+local HOME = common.HOME
 local SESSIONS = HOME .. "/.omp/agent/sessions/"
 local START_TRIES = 20 -- at window start, wait up to 10 s for the host half
 local MAX_FOLDERS = 1000 -- subfolders the folder picker lists
@@ -208,36 +208,46 @@ local function start_omp(cx: WindowCx, dir: string)
 end
 
 local function is_dir(path: string): boolean
+	if path == "" then
+		return false
+	elseif tern.runtime.os == "windows" then
+		-- Windows drops a trailing `.`, so only listing tells a folder.
+		return (pcall(tern.fs.list, path))
+	end
 	-- `file/.` doesn't exist, so this is false for files.
-	return path ~= "" and tern.fs.exists(if path == "/" then path else path .. "/.")
+	return tern.fs.exists(if path == "/" then path else path .. "/.")
 end
 
+-- Paths here are `/`-separated (common.slashes) and start at a root: "/",
+-- or a drive ("C:/") on Windows.
 local function join(dir: string, name: string): string
-	return if dir == "/" then "/" .. name else dir .. "/" .. name
+	return if string.sub(dir, -1) == "/" then dir .. name else dir .. "/" .. name
 end
 
 local function parent(dir: string): string
+	local root = common.root(dir)
 	local up = string.match(dir, "^(.*)/[^/]+$")
-	return if up == nil or up == "" then "/" else up
+	return if up == nil or #up < #root then root else up
 end
 
 -- A typed path made absolute: `~` is home, relative paths start at `dir`.
 local function resolve(dir: string, typed: string): string
-	local path = string.match(typed, "^%s*(.-)%s*$") or ""
+	local path = common.slashes(string.match(typed, "^%s*(.-)%s*$") or "")
 	if path == "~" or string.sub(path, 1, 2) == "~/" then
 		path = HOME .. string.sub(path, 2)
-	elseif string.sub(path, 1, 1) ~= "/" then
+	elseif common.root(path) == "" then
 		path = join(dir, path)
 	end
+	local root = common.root(path)
 	local parts: { string } = {}
-	for part in string.gmatch(path, "[^/]+") do
+	for part in string.gmatch(string.sub(path, #root + 1), "[^/]+") do
 		if part == ".." then
 			table.remove(parts)
 		elseif part ~= "." then
 			table.insert(parts, part)
 		end
 	end
-	return "/" .. table.concat(parts, "/")
+	return root .. table.concat(parts, "/")
 end
 
 -- `dir`'s visible subfolders, sorted.
@@ -315,11 +325,12 @@ end
 -- or go to another folder (a subfolder, up, home or a typed path) and pick
 -- again there.
 browse = function(cx: WindowCx, dir: string, recent: { string })
+	dir = common.slashes(dir)
 	local here = common.tilde(dir)
 	local items: { PickItem } = {
 		{ label = "Start omp here", detail = here, icon = "play", group = here, go = "start", path = dir },
 	}
-	if dir ~= "/" then
+	if dir ~= common.root(dir) then
 		table.insert(items, { label = "..", detail = common.tilde(parent(dir)), icon = "arrow-up", group = here, go = "open", path = parent(dir) })
 	end
 	if dir ~= HOME and HOME ~= "" then

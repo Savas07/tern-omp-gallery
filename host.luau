@@ -25,7 +25,7 @@ local common = require("./common")
 
 local ui = tern.ui
 
-local HOME = tern.getenv("HOME") or ""
+local HOME = common.HOME
 local ROOT = HOME .. "/.omp/agent/sessions"
 local INDEX_FILE = tern.plugin.data .. "/index.json"
 local INDEX_VERSION = 3
@@ -80,7 +80,8 @@ local OMP: { string } = {
 }
 
 -- Lists every session file, and the subagent sessions in the folder beside
--- each, with sizes and mtimes in one process. Exit 3: no sessions folder yet.
+-- each, with sizes and mtimes in one process: "<mtime> <size> ./<rel>" lines.
+-- Exit 3: no sessions folder yet.
 local LIST_SCRIPT = [[
 cd "$1" 2>/dev/null || exit 3
 if stat --version >/dev/null 2>&1; then
@@ -88,6 +89,27 @@ if stat --version >/dev/null 2>&1; then
 fi
 exec find . -mindepth 2 -type f -name '*.jsonl' -exec stat -f '%m %z %N' -- {} +
 ]]
+
+-- The same in PowerShell, for Windows, with `$root` set in front of it. One
+-- line without double quotes, so it survives the command line as it is.
+local LIST_POWERSHELL = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+	.. "if (-not (Test-Path -LiteralPath $root -PathType Container)) { exit 3 }; "
+	.. "$sep = [IO.Path]::DirectorySeparatorChar; "
+	.. "$skip = (Get-Item -LiteralPath $root).FullName.TrimEnd($sep).Length + 1; "
+	.. "Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.jsonl -ErrorAction SilentlyContinue | ForEach-Object { "
+	.. "$rel = $_.FullName.Substring($skip); "
+	.. "if ($rel.Contains($sep) -and $rel.EndsWith('.jsonl')) { "
+	.. "$at = [DateTimeOffset]::new($_.LastWriteTimeUtc).ToUnixTimeSeconds(); "
+	.. "'{0} {1} ./{2}' -f $at, $_.Length, $rel.Replace($sep, '/') } }"
+
+-- The listing command for this OS.
+local function list_command(): { string }
+	if tern.runtime.os == "windows" then
+		local root = "$root = '" .. string.gsub(ROOT, "'", "''") .. "'; "
+		return { "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", root .. LIST_POWERSHELL }
+	end
+	return { "/bin/sh", "-c", LIST_SCRIPT, "sh", ROOT }
+end
 
 type FileStat = {
 	rel: string, -- "<project folder>/<file>.jsonl" under ROOT
@@ -645,9 +667,9 @@ local function read_part(f: FileStat): Part?
 	return nil
 end
 
--- Every session file under ROOT and its subagents'. `stat` gives sizes and
--- mtimes for the cache; without a shell (Windows) the folders are listed and
--- every file is read.
+-- Every session file under ROOT and its subagents'. `stat` (PowerShell on
+-- Windows) gives sizes and mtimes for the cache; when that fails the folders
+-- are listed and every file is read.
 local function list_files(done: ({ FileStat }) -> ())
 	local function by_listing()
 		local files: { FileStat } = {}
@@ -695,7 +717,7 @@ local function list_files(done: ({ FileStat }) -> ())
 	end
 	local started = pcall(function()
 		tern.process.run(
-			{ "/bin/sh", "-c", LIST_SCRIPT, "sh", ROOT },
+			list_command(),
 			{ timeout_ms = 20000 },
 			function(r: ProcessResult)
 				if r.status == 3 then
@@ -704,7 +726,7 @@ local function list_files(done: ({ FileStat }) -> ())
 					by_listing()
 				else
 					local files: { FileStat } = {}
-					for row in string.gmatch(r.stdout, "[^\n]+") do
+					for row in string.gmatch(r.stdout, "[^\r\n]+") do
 						local mtime, size, rel = string.match(row, "^(%d+) (%d+) %./(.+)$")
 						if rel then
 							table.insert(files, { rel = rel, size = tonumber(size) :: number, mtime = tonumber(mtime) :: number })
