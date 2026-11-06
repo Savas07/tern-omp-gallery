@@ -11,7 +11,8 @@
 --
 -- Keys: type to search, ←↑↓→ move, Enter resumes in a new tab (⌥Enter: in a
 -- split), ⌃N starts a new session in a folder you pick, Tab/⇧Tab cycle the
--- project filter, Esc clears, ⌃R refreshes.
+-- project filter, ⌃G the grouping (none, workspace, last active), ⌃L
+-- switches cards and list, Esc clears, ⌃R refreshes.
 
 local common = require("./common")
 
@@ -29,13 +30,20 @@ local SLICE_MS = 120 -- parsing per timer tick
 local WAKE_MS = 5000 -- a focus refresh this soon after the last scan is skipped
 
 local PAGE = 24 -- cards per page: whole rows at 1 to 4 columns
+local LIST_PAGE = 60 -- list rows per page
 local CARD_CELLS = 44 -- pane width one column of cards needs, in cells
 local MAX_COLUMNS = 4
 
 local ALL = "*" -- the project filter's "every project"
 local SEARCH_ID = "main.bar.search"
 local PROJECT_ID = "main.bar.project"
+local GROUP_ID = "main.bar.group"
+local VIEW_ID = "main.bar.view"
 local GRID_ID = "main.grid"
+
+local VIEWS = { "cards", "list" }
+local GROUPINGS = { "none", "workspace", "time" }
+local LAYOUT_FILE = tern.plugin.data .. "/layout.json" -- the last view and grouping chosen
 
 -- `omp` by name first, then where it gets installed: a daemon started by
 -- launchd has a PATH without Tern's own omp.
@@ -89,11 +97,35 @@ type State = {
 	query: string,
 	project: string, -- a cwd, or ALL
 	project_open: boolean,
+	view: string, -- one of VIEWS
+	grouping: string, -- one of GROUPINGS
+	grouping_open: boolean,
+	folded: { [string]: boolean }, -- collapsed groups, by group key
 	selected: string?, -- a session key
 	pages: number,
 }
 
 type Project = { cwd: string, count: number }
+
+type Group = {
+	key: string, -- node key
+	title: string?, -- nil for the one group of an ungrouped view
+	cwd: string?, -- a workspace group's folder
+	sessions: { Session },
+	drawn: number, -- how many of `sessions` the view draws
+}
+
+-- What the view draws, which is what the keys move through.
+type Plan = {
+	shown: { Session }, -- every session the filters let through
+	groups: { Group },
+	cols: number,
+	order: { Session }, -- the drawn sessions in reading order
+	rows: { { number } }, -- indexes into `order`, one row of cards at a time
+	ids: { [string]: string }, -- node id by session key
+	at: { [string]: number }, -- index into `order` by session key
+	total: number, -- sessions outside folded groups
+}
 
 -- The index, shared by every gallery block of this host.
 local sessions: { [string]: Session } = {} -- by rel
@@ -782,24 +814,28 @@ local function projects(): { Project }
 	return out
 end
 
+-- A short name for each project folder: its own name, with its parent's when
+-- two folders share a name.
+local function project_names(): { [string]: string }
+	local all = projects()
+	local seen: { [string]: number } = {}
+	for _, p in all do
+		local name = basename(p.cwd)
+		seen[name] = (seen[name] or 0) + 1
+	end
+	local names: { [string]: string } = {}
+	for _, p in all do
+		local name = basename(p.cwd)
+		if (seen[name] or 0) > 1 then
+			name = string.match(p.cwd, "([^/]+/[^/]+)/*$") or name
+		end
+		names[p.cwd] = name
+	end
+	return names
+end
+
 local function columns(cx: BlockCx): number
 	return math.clamp(cx.cols // CARD_CELLS, 1, MAX_COLUMNS)
-end
-
--- The selected card's place in `shown`: the selected session, else the first.
-local function current(state: State, shown: { Session }): number
-	if state.selected then
-		for i, s in shown do
-			if s.key == state.selected then
-				return i
-			end
-		end
-	end
-	return 1
-end
-
-local function card_id(shown: { Session }, i: number, cols: number): string
-	return GRID_ID .. ".r" .. ((i - 1) // cols + 1) .. "." .. shown[i].key
 end
 
 local function find(key: string?): Session?
@@ -809,22 +845,6 @@ local function find(key: string?): Session?
 		end
 	end
 	return nil
-end
-
-local function move(state: State, cx: BlockCx, delta: number): boolean
-	local shown = filtered(state)
-	if #shown == 0 then
-		return false
-	end
-	local i = math.clamp(current(state, shown) + delta, 1, #shown)
-	state.selected = shown[i].key
-	if i > state.pages * PAGE then
-		state.pages = (i - 1) // PAGE + 1
-	end
-	-- Draw first, so the card the reveal names exists.
-	cx:render()
-	cx:frame({ { "reveal", card_id(shown, i, columns(cx)), "nearest" } })
-	return true
 end
 
 local function set_query(state: State, query: string)
@@ -855,6 +875,207 @@ local function on_screen(): { [string]: boolean }
 		end
 	end
 	return open
+end
+
+local function is_held(s: Session, open: { [string]: boolean }): boolean
+	return live[s.id] == true or open[s.key] == true
+end
+
+local function page_size(state: State): number
+	return if state.view == "list" then LIST_PAGE else PAGE
+end
+
+-- A node key for any text (a folder path), the same every time.
+local function slug(text: string): string
+	local h = 5381
+	for i = 1, #text do
+		h = (h * 33 + string.byte(text, i)) % 4294967296
+	end
+	return string.format("%08x", h)
+end
+
+-- Local midnight today, in seconds since the epoch.
+local function today(): number
+	local now = os.date("*t") :: any
+	return os.time({ year = now.year, month = now.month, day = now.day, hour = 0, min = 0, sec = 0 })
+end
+
+-- The "last active" groups between "Running now" and "Older": a session
+-- last active on or after `days` days before today goes in the first that
+-- takes it.
+local SPANS = {
+	{ key = "today", title = "Today", days = 0 },
+	{ key = "yesterday", title = "Yesterday", days = 1 },
+	{ key = "week", title = "Last 7 days", days = 6 },
+	{ key = "month", title = "Last 30 days", days = 29 },
+}
+
+local function groups_of(state: State, shown: { Session }, open: { [string]: boolean }): { Group }
+	if state.grouping == "workspace" then
+		local names = project_names()
+		local by: { [string]: Group } = {}
+		local out: { Group } = {}
+		for _, s in shown do
+			local g = by[s.cwd]
+			if g == nil then
+				g = {
+					key = "w" .. slug(s.cwd),
+					title = if s.cwd == "" then "Unknown folder" else names[s.cwd] or basename(s.cwd),
+					cwd = s.cwd,
+					sessions = {},
+					drawn = 0,
+				}
+				by[s.cwd] = g
+				table.insert(out, g)
+			end
+			table.insert(g.sessions, s)
+		end
+		return out
+	elseif state.grouping == "time" then
+		local groups: { Group } = { { key = "trunning", title = "Running now", sessions = {}, drawn = 0 } }
+		for _, span in SPANS do
+			table.insert(groups, { key = "t" .. span.key, title = span.title, sessions = {}, drawn = 0 })
+		end
+		table.insert(groups, { key = "tolder", title = "Older", sessions = {}, drawn = 0 })
+		local start = today()
+		for _, s in shown do
+			local into = groups[#groups]
+			if is_held(s, open) then
+				into = groups[1]
+			else
+				for i, span in SPANS do
+					if s.updated >= start - span.days * 86400 then
+						into = groups[i + 1]
+						break
+					end
+				end
+			end
+			table.insert(into.sessions, s)
+		end
+		local out: { Group } = {}
+		for _, g in groups do
+			if #g.sessions > 0 then
+				table.insert(out, g)
+			end
+		end
+		return out
+	end
+	return { { key = "all", sessions = shown, drawn = 0 } }
+end
+
+-- Folded groups draw their heading only; sessions past the pages shown wait
+-- behind the pager.
+local function plan(state: State, cx: BlockCx, open: { [string]: boolean }): Plan
+	local shown = filtered(state)
+	local cols = if state.view == "list" then 1 else columns(cx)
+	local limit = state.pages * page_size(state)
+	local p: Plan = {
+		shown = shown,
+		groups = groups_of(state, shown, open),
+		cols = cols,
+		order = {},
+		rows = {},
+		ids = {},
+		at = {},
+		total = 0,
+	}
+	for _, g in p.groups do
+		if g.title and state.folded[g.key] then
+			continue
+		end
+		p.total += #g.sessions
+		local base = if g.title then GRID_ID .. "." .. g.key else GRID_ID
+		g.drawn = math.clamp(limit - #p.order, 0, #g.sessions)
+		for i = 1, g.drawn do
+			local s = g.sessions[i]
+			table.insert(p.order, s)
+			p.at[s.key] = #p.order
+			if (i - 1) % cols == 0 then
+				table.insert(p.rows, {})
+			end
+			table.insert(p.rows[#p.rows], #p.order)
+			p.ids[s.key] = if state.view == "list"
+				then base .. ".list." .. s.key
+				else base .. ".r" .. ((i - 1) // cols + 1) .. "." .. s.key
+		end
+	end
+	return p
+end
+
+-- The selected session: the one picked, else the first drawn.
+local function chosen(state: State, p: Plan): Session?
+	return p.order[p.at[state.selected or ""] or 1]
+end
+
+-- Moves the selection `n` sessions, or `n` rows of cards with `rows`. Moving
+-- past the last one drawn shows the next page.
+local function move(state: State, cx: BlockCx, n: number, rows: boolean): boolean
+	local open = on_screen()
+	local p = plan(state, cx, open)
+	if #p.order == 0 then
+		return false
+	end
+	local i = p.at[state.selected or ""] or 1
+	local r, c = 1, 1
+	for ri, row in p.rows do
+		local ci = table.find(row, i)
+		if ci then
+			r, c = ri, ci
+			break
+		end
+	end
+	local past = if rows then r + n > #p.rows else i + n > #p.order
+	if past and p.total > #p.order then
+		state.pages = if n == math.huge then math.ceil(p.total / page_size(state)) else state.pages + 1
+		p = plan(state, cx, open)
+	end
+	local target = math.clamp(i + n, 1, #p.order)
+	if rows then
+		local row = p.rows[math.clamp(r + n, 1, #p.rows)]
+		target = row[math.min(c, #row)]
+	end
+	local s = p.order[target]
+	state.selected = s.key
+	-- Draw first, so the node the reveal names exists.
+	cx:render()
+	cx:frame({ { "reveal", p.ids[s.key], "nearest" } })
+	return true
+end
+
+local function one_of(value: any, allowed: { string }): string?
+	return if type(value) == "string" and table.find(allowed, value) then value else nil
+end
+
+-- The view and grouping last chosen, for galleries opened later.
+local function load_layout(): (string?, string?)
+	local ok, data = pcall(function(): any
+		return tern.json.decode(tern.fs.read(LAYOUT_FILE))
+	end)
+	if ok and type(data) == "table" then
+		return one_of(data.view, VIEWS), one_of(data.grouping, GROUPINGS)
+	end
+	return nil, nil
+end
+
+local function set_layout(state: State, view: string, grouping: string)
+	if view == state.view and grouping == state.grouping then
+		return
+	end
+	state.view, state.grouping, state.pages = view, grouping, 1
+	local ok, err = pcall(function()
+		if not tern.fs.exists(tern.plugin.data) then
+			tern.fs.mkdir(tern.plugin.data)
+		end
+		tern.fs.write(LAYOUT_FILE, tern.json.encode({ view = view, grouping = grouping }))
+	end)
+	if not ok then
+		tern.log.warn("omp-gallery: layout not saved", err)
+	end
+end
+
+local function cycle(allowed: { string }, value: string, step: number): string
+	local at = table.find(allowed, value) or 1
+	return allowed[(at - 1 + step) % #allowed + 1]
 end
 
 -- Asks the window half to resume `s` (`how`: "tab" or "split"), or to show the
@@ -946,19 +1167,10 @@ local function stats_strip(shown: { Session }): Node
 end
 
 local function project_options(): { any }
-	local all = projects()
-	local names: { [string]: number } = {}
-	for _, p in all do
-		local name = basename(p.cwd)
-		names[name] = (names[name] or 0) + 1
-	end
+	local names = project_names()
 	local options: { any } = { { value = ALL, label = "All projects", detail = group(#list) } }
-	for _, p in all do
-		local label = basename(p.cwd)
-		if (names[label] or 0) > 1 then
-			label = string.match(p.cwd, "([^/]+/[^/]+)/*$") or label
-		end
-		table.insert(options, { value = p.cwd, label = label, detail = group(p.count), icon = "folder" })
+	for _, p in projects() do
+		table.insert(options, { value = p.cwd, label = names[p.cwd], detail = group(p.count), icon = "folder" })
 	end
 	return options
 end
@@ -981,6 +1193,24 @@ local function toolbar(state: State): Node
 			value = state.project,
 			open = state.project_open,
 			options = project_options(),
+		}),
+		ui.node("select", {
+			key = "group",
+			variant = "quiet",
+			label = "Group",
+			value = state.grouping,
+			open = state.grouping_open,
+			options = {
+				{ value = "none", label = "None" },
+				{ value = "workspace", label = "Workspace", icon = "folder" },
+				{ value = "time", label = "Last active", icon = "clock" },
+			},
+		}),
+		ui.node("tabs", {
+			key = "view",
+			variant = "segmented",
+			active = state.view,
+			items = { { id = "cards", label = "Cards" }, { id = "list", label = "List" } },
 		}),
 	})
 end
@@ -1091,26 +1321,148 @@ local function session_card(s: Session, id: string, selected: boolean, held: boo
 	return ui.node("card", props, kids)
 end
 
--- Explicit rows of equal cards, the last row padded, so every column lines up.
-local function grid(state: State, shown: { Session }, cols: number, open: { [string]: boolean }): Node
-	local limit = math.min(#shown, state.pages * PAGE)
-	local sel = current(state, shown)
+-- A session as one list row: title, folder and prompt, then when.
+local function session_item(s: Session, held: boolean): Node
+	local glyph, code, text = split_title(s.title)
+	local label: { Span | string } = {}
+	if glyph then
+		table.insert(label, ui.span(glyph .. " "))
+	end
+	if text ~= "" then
+		table.insert(label, ui.span(text, "strong"))
+	else
+		table.insert(label, ui.span(if s.big then "Large session" else "Untitled session", "muted"))
+	end
+	if code then
+		table.insert(label, ui.span("  " .. code, "accent"))
+	end
+	local detail: { Span | string } = { ui.span(if s.cwd ~= "" then tilde(s.cwd) else "unknown folder", "path") }
+	if s.prompt ~= "" then
+		table.insert(detail, ui.span("   " .. s.prompt, "dim"))
+	end
+	local value: { Span | string } = {}
+	if held then
+		table.insert(value, ui.span("Running · ", "success"))
+	end
+	table.insert(value, ui.span(ago(s.updated), "muted"))
+	return ui.node("item", {
+		key = s.key,
+		label = label,
+		detail = detail,
+		value = value,
+		icon = if s.provider ~= "" then "provider:" .. s.provider else "app-omp",
+		actions = { click = "pick=" .. s.key, dblclick = "open=" .. s.key, menu = card_menu(s, held) },
+	})
+end
+
+-- A group's drawn sessions as rows of equal cards, the last row padded, so
+-- every column lines up.
+local function card_rows(g: Group, p: Plan, sel: string?, open: { [string]: boolean }): { Node }
 	local rows: { Node } = {}
-	local r = 0
-	for first = 1, limit, cols do
-		r += 1
-		local row_id = GRID_ID .. ".r" .. r
+	for first = 1, g.drawn, p.cols do
 		local cells: { Node } = {}
-		for i = first, math.min(first + cols - 1, limit) do
-			local s = shown[i]
-			table.insert(cells, session_card(s, row_id .. "." .. s.key, i == sel, live[s.id] == true or open[s.key] == true))
+		for i = first, math.min(first + p.cols - 1, g.drawn) do
+			local s = g.sessions[i]
+			table.insert(cells, session_card(s, p.ids[s.key], s.key == sel, is_held(s, open)))
 		end
-		for pad = #cells + 1, cols do
+		for pad = #cells + 1, p.cols do
 			table.insert(cells, ui.node("row", { key = "pad" .. pad, grow = 1, basis = 0 }))
 		end
-		table.insert(rows, ui.node("row", { key = "r" .. r, gap = "md", align = "stretch" }, cells))
+		table.insert(rows, ui.node("row", { key = "r" .. ((first - 1) // p.cols + 1), gap = "md", align = "stretch" }, cells))
 	end
-	return ui.node("col", { key = "grid", gap = "md" }, rows)
+	return rows
+end
+
+local function session_list(g: Group, p: Plan, sel: string?, open: { [string]: boolean }): Node
+	local items: { Node } = {}
+	local selected: string? = nil
+	for i = 1, g.drawn do
+		local s = g.sessions[i]
+		if s.key == sel then
+			selected = p.ids[s.key]
+		end
+		table.insert(items, session_item(s, is_held(s, open)))
+	end
+	return ui.node("list", { key = "list", selected = selected }, items)
+end
+
+local function group_body(state: State, g: Group, p: Plan, sel: string?, open: { [string]: boolean }): { Node }
+	if state.view == "list" then
+		return { session_list(g, p, sel, open) }
+	end
+	return card_rows(g, p, sel, open)
+end
+
+-- A group's heading: its name, its folder and counts; a workspace's also
+-- starts a session there or shows only it.
+local function group_head(g: Group, open: { [string]: boolean }): Node
+	local spans: { Span | string } = { ui.span(g.title or "", "strong") }
+	local cwd = g.cwd or ""
+	if cwd ~= "" then
+		table.insert(spans, ui.span("   " .. tilde(cwd), "muted"))
+	end
+	table.insert(spans, ui.span("   " .. count(#g.sessions, "session"), "dim"))
+	if g.cwd then
+		local held = 0
+		for _, s in g.sessions do
+			if is_held(s, open) then
+				held += 1
+			end
+		end
+		if held > 0 then
+			table.insert(spans, ui.span(" · " .. held .. " running", "success"))
+		end
+	end
+	local kids: { Node } = { ui.node("text", { key = "title", grow = 1, wrap = "none", truncate = "end", spans = spans }) }
+	if cwd ~= "" then
+		table.insert(kids, ui.button("New session", {
+			key = "new",
+			icon = "plus",
+			variant = "quiet",
+			size = "sm",
+			actions = { click = "newin=" .. cwd },
+		}))
+		table.insert(kids, ui.button("Only this", {
+			key = "only",
+			icon = "funnel",
+			variant = "quiet",
+			size = "sm",
+			actions = { click = "only=" .. cwd },
+		}))
+	end
+	return ui.node("row", { key = "head", gap = "sm", align = "center" }, kids)
+end
+
+local function sessions_view(state: State, p: Plan, open: { [string]: boolean }): Node
+	local current = chosen(state, p)
+	local sel = if current then current.key else nil
+	local kids: { Node } = {}
+	for _, g in p.groups do
+		if g.title == nil then
+			kids = group_body(state, g, p, sel, open)
+			break
+		end
+		local folded = state.folded[g.key] == true
+		if not folded and g.drawn == 0 then
+			break -- behind the pager
+		end
+		local body: { Node } = { group_head(g, open) }
+		if not folded then
+			for _, node in group_body(state, g, p, sel, open) do
+				table.insert(body, node)
+			end
+		end
+		table.insert(kids, ui.node("section", {
+			key = g.key,
+			head = GRID_ID .. "." .. g.key .. ".head",
+			collapsible = true,
+			collapsed = folded,
+		}, body))
+		if not folded and g.drawn < #g.sessions then
+			break
+		end
+	end
+	return ui.node("col", { key = "grid", gap = "md" }, kids)
 end
 
 local function loading(cols: number): Node
@@ -1163,6 +1515,8 @@ local function legend(): Node
 		{ "alt+enter", "split" },
 		{ "ctrl+n", "new session" },
 		{ "tab", "project" },
+		{ "ctrl+g", "group" },
+		{ "ctrl+l", "cards/list" },
 		{ "esc", "clear" },
 		{ "ctrl+r", "refresh" },
 	}
@@ -1191,27 +1545,27 @@ local function view(state: State, cx: BlockCx): BlockView
 			state.project = ALL
 		end
 	end
-	local shown = filtered(state)
-	local cols = columns(cx)
+	local open = on_screen()
+	local p = plan(state, cx, open)
 	local main: { Node } = { head_row() }
 	if #list > 0 then
-		table.insert(main, stats_strip(shown))
+		table.insert(main, stats_strip(p.shown))
 	end
 	table.insert(main, toolbar(state))
-	if #shown > 0 then
-		table.insert(main, grid(state, shown, cols, on_screen()))
-		if #shown > state.pages * PAGE then
+	if #p.shown > 0 then
+		table.insert(main, sessions_view(state, p, open))
+		if p.total > #p.order then
 			table.insert(main, ui.node("pager", {
 				key = "more",
 				variant = "more",
 				page = state.pages,
-				size = PAGE,
-				total = #shown,
+				size = page_size(state),
+				total = p.total,
 				label = "sessions",
 			}))
 		end
 	elseif #list == 0 and problem == nil and (scanning or scanned_clock == nil) then
-		table.insert(main, loading(cols))
+		table.insert(main, loading(columns(cx)))
 	else
 		table.insert(main, nothing(state))
 	end
@@ -1233,8 +1587,7 @@ local function drop_word(s: string): string
 end
 
 local function open_selected(state: State, cx: BlockCx, how: string): boolean
-	local shown = filtered(state)
-	local s = shown[current(state, shown)]
+	local s = chosen(state, plan(state, cx, on_screen()))
 	if s == nil then
 		return false
 	end
@@ -1261,32 +1614,36 @@ local function key(state: State, k: Key, cx: BlockCx): boolean?
 			set_query(state, drop_word(state.query))
 		elseif name == "n" then
 			new_session(state, cx)
+		elseif name == "g" then
+			set_layout(state, state.view, cycle(GROUPINGS, state.grouping, if k.shift then -1 else 1))
+		elseif name == "l" then
+			set_layout(state, cycle(VIEWS, state.view, 1), state.grouping)
 		else
 			return false
 		end
 		return true
 	end
 	if name == "left" then
-		return move(state, cx, -1)
+		return move(state, cx, -1, false)
 	elseif name == "right" then
-		return move(state, cx, 1)
+		return move(state, cx, 1, false)
 	elseif name == "up" then
-		return move(state, cx, -columns(cx))
+		return move(state, cx, -1, true)
 	elseif name == "down" then
-		return move(state, cx, columns(cx))
+		return move(state, cx, 1, true)
 	elseif name == "page_up" then
-		return move(state, cx, -columns(cx) * 3)
+		return move(state, cx, -3, true)
 	elseif name == "page_down" then
-		return move(state, cx, columns(cx) * 3)
+		return move(state, cx, 3, true)
 	elseif name == "home" then
-		return move(state, cx, -math.huge)
+		return move(state, cx, -math.huge, false)
 	elseif name == "end" then
-		return move(state, cx, math.huge)
+		return move(state, cx, math.huge, false)
 	elseif name == "enter" then
 		return open_selected(state, cx, if k.alt then "split" else "tab")
 	elseif name == "escape" then
-		if state.project_open then
-			state.project_open = false
+		if state.project_open or state.grouping_open then
+			state.project_open, state.grouping_open = false, false
 		elseif state.query ~= "" then
 			set_query(state, "")
 		elseif state.project ~= ALL then
@@ -1340,6 +1697,11 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 		elseif act == "reset" then
 			set_query(state, "")
 			state.project = ALL
+		elseif act == "newin" and type(ev.value) == "string" and ev.value ~= "" then
+			new_session(state, cx, ev.value)
+		elseif act == "only" and type(ev.value) == "string" then
+			state.project = ev.value
+			state.pages = 1
 		elseif s == nil then
 			return
 		elseif act == "pick" then
@@ -1365,6 +1727,16 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 		state.pages = 1
 	elseif ev.ev == "toggle" and ev.id == PROJECT_ID then
 		state.project_open = ev.open == true
+	elseif ev.ev == "change" and ev.id == GROUP_ID then
+		state.grouping_open = false
+		set_layout(state, state.view, one_of(ev.value, GROUPINGS) or state.grouping)
+	elseif ev.ev == "toggle" and ev.id == GROUP_ID then
+		state.grouping_open = ev.open == true
+	elseif ev.ev == "select" and ev.id == VIEW_ID then
+		set_layout(state, one_of(ev.item, VIEWS) or state.view, state.grouping)
+	elseif ev.ev == "toggle" and type(ev.key) == "string" and ev.collapsed ~= nil then
+		-- A group's heading folded or unfolded it.
+		state.folded[ev.key] = ev.collapsed == true
 	elseif ev.ev == "focus" and ev.id == SEARCH_ID then
 		cx:frame({ { "focus", SEARCH_ID } })
 	end
@@ -1380,11 +1752,25 @@ tern.block.define("gallery", {
 		if previous then
 			retire(previous)
 		end
+		local last: { [string]: any } = if type(saved) == "table" then saved else {}
+		local view, grouping = load_layout()
+		local folded: { [string]: boolean } = {}
+		if type(last.folded) == "table" then
+			for k, v in last.folded do
+				if type(k) == "string" and v == true then
+					folded[k] = true
+				end
+			end
+		end
 		local state: State = {
 			cx = cx,
 			query = "",
-			project = if type(saved) == "table" and type(saved.project) == "string" then saved.project else ALL,
+			project = if type(last.project) == "string" then last.project else ALL,
 			project_open = false,
+			view = one_of(last.view, VIEWS) or view or "cards",
+			grouping = one_of(last.grouping, GROUPINGS) or grouping or "none",
+			grouping_open = false,
+			folded = folded,
 			selected = nil,
 			pages = 1,
 		}
@@ -1405,6 +1791,6 @@ tern.block.define("gallery", {
 	event = event,
 
 	save = function(state: State): any
-		return { project = state.project }
+		return { project = state.project, view = state.view, grouping = state.grouping, folded = state.folded }
 	end,
 })
