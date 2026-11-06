@@ -10,6 +10,8 @@ local HOME = tern.getenv("HOME") or ""
 local SESSIONS = HOME .. "/.omp/agent/sessions/"
 local START_TRIES = 20 -- at window start, wait up to 10 s for the host half
 local MAX_FOLDERS = 1000 -- subfolders the folder picker lists
+local RECENT = 12 -- project folders the folder picker offers
+local INDEX_FILE = tern.plugin.data .. "/index.json" -- written by the host half
 
 -- The gallery's pane in this window, if it has one.
 local function gallery(cx: WindowCx): number?
@@ -92,7 +94,7 @@ end)
 -- Coming back to the gallery picks up sessions that changed meanwhile.
 tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	local p = cx.session:pane(ev.pane)
-	if p and p.block == common.KIND then
+	if p and p.block == common.KIND and p.exited == nil then
 		cx.session:event(ev.pane, { ev = "action", id = "main", act = "wake" })
 	end
 end)
@@ -218,6 +220,37 @@ local function folders(dir: string): { string }
 	return out
 end
 
+-- The folders of the most recently used sessions in the gallery's index.
+local function recent_projects(): { string }
+	local out: { string } = {}
+	local ok, data = pcall(function(): any
+		return tern.json.decode(tern.fs.read(INDEX_FILE))
+	end)
+	if not ok or type(data) ~= "table" or type(data.sessions) ~= "table" then
+		return out
+	end
+	local sessions: { { cwd: string, updated: number } } = {}
+	for _, s in data.sessions do
+		if type(s) == "table" and type(s.cwd) == "string" and s.cwd ~= "" and type(s.updated) == "number" then
+			table.insert(sessions, { cwd = s.cwd, updated = s.updated })
+		end
+	end
+	table.sort(sessions, function(a, b): boolean
+		return a.updated > b.updated
+	end)
+	local seen: { [string]: boolean } = {}
+	for _, s in sessions do
+		if not seen[s.cwd] then
+			seen[s.cwd] = true
+			table.insert(out, s.cwd)
+			if #out >= RECENT then
+				break
+			end
+		end
+	end
+	return out
+end
+
 local browse: (cx: WindowCx, dir: string, recent: { string }) -> ()
 
 local function type_path(cx: WindowCx, dir: string, recent: { string })
@@ -304,13 +337,62 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 		elseif verb == "start" and is_dir(fields.cwd or "") then
 			start_omp(cx, fields.cwd)
 		elseif verb == "new" then
-			local recent: { string } = {}
-			for path in string.gmatch(fields.recent or "", "[^\n]+") do
-				table.insert(recent, path)
-			end
 			local cwd = fields.cwd or ""
-			browse(cx, if is_dir(cwd) then cwd else HOME, recent)
+			browse(cx, if is_dir(cwd) then cwd else HOME, recent_projects())
 		end
 	end
 	return { handled = true }
 end)
+
+-- New tab (the tab bar's + and ⌘T) asks what to open: a shell, a new omp
+-- session or the gallery. "Toggle the new tab menu" turns that off and on.
+local function asks_on_new_tab(): boolean
+	return tern.kv.get("new_tab_menu") ~= false
+end
+
+tern.override("new_tab", function(cx: WindowCx): boolean?
+	if not asks_on_new_tab() then
+		return false
+	end
+	local focused = cx.session:focused()
+	local pane = if focused then cx.session:pane(focused) else nil
+	local here = if pane then pane.cwd else nil
+	local cwd: string = if here and is_dir(here) then here else HOME
+	cx:pick({
+		items = {
+			{ label = "New tab", detail = "a shell", icon = "terminal", go = "tab" },
+			{ label = "New omp session…", detail = "in a folder you pick", icon = "app-omp", go = "omp" },
+			{ label = "omp sessions", detail = "every past session", icon = "history", go = "gallery" },
+		},
+		placeholder = "Open in a new tab",
+		icon = "plus",
+		action = "open",
+	}):next(function(item: PickItem?, _err: string?, later: WindowCx?)
+		if item == nil or later == nil then
+			return
+		end
+		if item.go == "tab" then
+			later:command("new_tab") -- Tern's own: overrides don't run inside a handler
+		elseif item.go == "omp" then
+			browse(later, cwd, recent_projects())
+		elseif not show(later) then
+			later:toast("error", "omp sessions are unavailable", "The plugin's host half isn't loaded on this host.")
+		end
+	end)
+	return true
+end)
+
+tern.command({
+	id = "new_tab_menu",
+	title = "Toggle the new tab menu",
+	icon = "plus",
+	run = function(cx: WindowCx)
+		local on = not asks_on_new_tab()
+		tern.kv.set("new_tab_menu", on)
+		if on then
+			cx:toast("info", "New tab asks what to open", "A shell, a new omp session or omp sessions.")
+		else
+			cx:toast("info", "New tab opens a shell", "Run “Toggle the new tab menu” to ask again.")
+		end
+	end,
+})

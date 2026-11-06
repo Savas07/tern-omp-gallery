@@ -31,7 +31,6 @@ local WAKE_MS = 5000 -- a focus refresh this soon after the last scan is skipped
 local PAGE = 24 -- cards per page: whole rows at 1 to 4 columns
 local CARD_CELLS = 44 -- pane width one column of cards needs, in cells
 local MAX_COLUMNS = 4
-local RECENT = 12 -- project folders the new session picker offers
 
 local ALL = "*" -- the project filter's "every project"
 local SEARCH_ID = "main.bar.search"
@@ -878,17 +877,7 @@ local function new_session(state: State, cx: BlockCx, cwd: string?)
 		cx:open(common.link("start", { cwd = cwd }))
 		return
 	end
-	local recent: { string } = {}
-	for _, p in projects() do
-		if #recent >= RECENT then
-			break
-		end
-		table.insert(recent, p.cwd)
-	end
-	cx:open(common.link("new", {
-		cwd = if state.project ~= ALL then state.project else "",
-		recent = table.concat(recent, "\n"),
-	}))
+	cx:open(common.link("new", { cwd = if state.project ~= ALL then state.project else "" }))
 end
 
 local function has_mod(ev: UiEvent, mod: string): boolean
