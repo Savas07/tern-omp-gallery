@@ -1,0 +1,36 @@
+/* omp-gallery: a session open in a colored tab wears the tab's color on its
+   card and its list row (role "omp-gallery.tab-<color>", set by host.luau), so
+   the cards of different tabs tell apart at a glance. The colors are Tern's
+   own tab colors. */
+
+[data-role='omp-gallery.tab-red'] { --omp-tab: light-dark(#ff3b30, #ff453a); }
+[data-role='omp-gallery.tab-orange'] { --omp-tab: light-dark(#ff9500, #ff9f0a); }
+[data-role='omp-gallery.tab-yellow'] { --omp-tab: light-dark(#e6ac00, #ffd60a); }
+[data-role='omp-gallery.tab-green'] { --omp-tab: light-dark(#28b450, #30d158); }
+[data-role='omp-gallery.tab-teal'] { --omp-tab: light-dark(#1ea0be, #40c8e0); }
+[data-role='omp-gallery.tab-blue'] { --omp-tab: light-dark(#007aff, #0a84ff); }
+[data-role='omp-gallery.tab-purple'] { --omp-tab: light-dark(#af52de, #bf5af2); }
+[data-role='omp-gallery.tab-pink'] { --omp-tab: light-dark(#ff2d55, #ff375f); }
+
+/* A wash of the color over the card's own background, a ring and a bar. */
+.sf-main[data-surface='plugin.omp-gallery.gallery'] .sf-card[data-role^='omp-gallery.tab-'] {
+	background-image: linear-gradient(rgb(from var(--omp-tab) r g b / 8%), rgb(from var(--omp-tab) r g b / 8%));
+	box-shadow:
+		inset 3px 0 0 var(--omp-tab),
+		inset 0 0 0 1px rgb(from var(--omp-tab) r g b / 45%),
+		0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+/* Selected keeps Tern's accent ring; the bar stays. */
+.sf-main[data-surface='plugin.omp-gallery.gallery'] .sf-card.selected[data-role^='omp-gallery.tab-'] {
+	box-shadow:
+		inset 3px 0 0 var(--omp-tab),
+		inset 0 0 0 1px var(--accent),
+		0 0 0 3px rgb(from var(--accent) r g b / 16%);
+}
+
+/* List rows: the bar and the wash; the selected row keeps the accent. */
+.sf-main[data-surface='plugin.omp-gallery.gallery'] .sf-item[data-role^='omp-gallery.tab-']:not(.sel) {
+	background-image: linear-gradient(rgb(from var(--omp-tab) r g b / 8%), rgb(from var(--omp-tab) r g b / 8%));
+	box-shadow: inset 3px 0 0 var(--omp-tab);
+}

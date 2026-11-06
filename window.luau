@@ -2,8 +2,9 @@
 -- omp-gallery, window half: the "Show omp sessions" command and its status
 -- line button, the gallery's tab at window start, a refresh whenever the
 -- gallery gets focus, how this window's omp panes are doing (working, waiting
--- or idle) whenever that changes, and the links the gallery block opens:
--- resume a session, or start a new one in a folder picked here.
+-- or idle) and their tabs' colors whenever that changes or the gallery asks,
+-- and the links the gallery block opens: resume a session, or start a new one
+-- in a folder picked here.
 
 local common = require("./common")
 
@@ -92,8 +93,9 @@ tern.on("window_start", function(cx: WindowCx)
 	start(cx, 1)
 end)
 
--- Tells the gallery block in `pane` something (`act`), with how each omp pane
--- of this window is doing (cx.agents:list() states by pane id, as JSON).
+-- Tells the gallery block in `pane` something (`act`), with a report of this
+-- window's panes (JSON): how each omp pane is doing (`states`, cx.agents:list()
+-- by pane id) and the color of each colored tab's panes (`colors`, by pane id).
 local function tell(cx: WindowCx, pane: number, act: string)
 	-- Raises when the block has ended (its plugin failed to load): nobody to tell.
 	pcall(function()
@@ -101,7 +103,21 @@ local function tell(cx: WindowCx, pane: number, act: string)
 		for _, a in cx.agents:list() do
 			states[tostring(a.pane)] = a.state
 		end
-		cx.session:event(pane, { ev = "action", id = "main", act = act, value = tern.json.encode(states) })
+		local tab_color: { [number]: string } = {}
+		for _, tab in cx.session:tabs() do
+			if tab.color then
+				tab_color[tab.id] = tab.color
+			end
+		end
+		local colors: { [string]: string } = {}
+		for _, p in cx.session:panes() do
+			local color = if p.tab then tab_color[p.tab] else nil
+			if color then
+				colors[tostring(p.pane)] = color
+			end
+		end
+		local report = tern.json.encode({ states = states, colors = colors })
+		cx.session:event(pane, { ev = "action", id = "main", act = act, value = report })
 	end)
 end
 
@@ -351,9 +367,12 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 		return nil
 	end
 	-- Only the gallery block asks, and every window showing it hears the
-	-- request: the window where it has focus acts on it.
+	-- request: the window where it has focus acts on it. A report goes to the
+	-- block that (re)started, from every window showing it.
 	local from = cx.session:pane(link.pane)
-	if from and from.block == common.KIND and cx.session:focused() == link.pane then
+	if from and from.block == common.KIND and verb == "report" then
+		tell(cx, link.pane, "agents")
+	elseif from and from.block == common.KIND and cx.session:focused() == link.pane then
 		if verb == "resume" then
 			resume(cx, fields, link.pane)
 		elseif verb == "start" and is_dir(fields.cwd or "") then

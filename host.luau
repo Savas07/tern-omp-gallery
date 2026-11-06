@@ -2,9 +2,13 @@
 -- omp-gallery, host half: the `gallery` block, every omp session on this
 -- machine as a grid of cards.
 --
--- Session files (~/.omp/agent/sessions/<project>/<time>_<id>.jsonl) are read
--- a few at a time on timer ticks and cached by size and mtime in
--- <data>/index.json, so a refresh reads only the sessions that changed.
+-- Session files (~/.omp/agent/sessions/<project>/<time>_<id>.jsonl), and the
+-- subagent sessions in the folder beside each, are read a few at a time on
+-- timer ticks and cached by size and mtime in <data>/index.json, so a refresh
+-- reads only the files that changed. Each card shows what its session spent
+-- (tokens and list-price dollars, subagents included) and takes the color of
+-- the tab it is open in. Archiving hides a session under the Archived button;
+-- deleting removes its files for good.
 -- A session omp holds shows what omp does with it: working on a turn (and
 -- for how long), waiting for the user's answer, or just open. The window half
 -- reports how its omp panes are doing; a session only an omp elsewhere holds
@@ -14,7 +18,8 @@
 -- Keys: type to search, ←↑↓→ move, Enter resumes in a new tab (⌥Enter: in a
 -- split), ⌃N starts a new session in a folder you pick, Tab/⇧Tab cycle the
 -- project filter, ⌃G the grouping (none, workspace, last active), ⌃L
--- switches cards and list, Esc clears, ⌃R refreshes.
+-- switches cards and list, ⌃E archives, ⌃D deletes (after asking), Esc
+-- clears, ⌃R refreshes.
 
 local common = require("./common")
 
@@ -23,7 +28,7 @@ local ui = tern.ui
 local HOME = tern.getenv("HOME") or ""
 local ROOT = HOME .. "/.omp/agent/sessions"
 local INDEX_FILE = tern.plugin.data .. "/index.json"
-local INDEX_VERSION = 2
+local INDEX_VERSION = 3
 
 local MAX_FILE = 160 * 1024 * 1024 -- larger session files are listed, not read
 local HEAD = 320 -- bytes at the start of a line that say what it is
@@ -32,6 +37,7 @@ local SLICE_MS = 120 -- parsing per timer tick
 local WAKE_MS = 5000 -- a focus refresh this soon after the last scan is skipped
 local SOON_MS = 400 -- after an agent's turn starts or ends, until its file shows it
 local TICK_MS = 20000 -- how often a list showing working sessions redraws their minutes
+local REPORT_MS = 500 -- after the block starts, until it asks the window half for its report
 
 local PAGE = 24 -- cards per page: whole rows at 1 to 4 columns
 local LIST_PAGE = 60 -- list rows per page
@@ -48,6 +54,19 @@ local GRID_ID = "main.grid"
 local VIEWS = { "cards", "list" }
 local GROUPINGS = { "none", "workspace", "time" }
 local LAYOUT_FILE = tern.plugin.data .. "/layout.json" -- the last view and grouping chosen
+local ARCHIVE_FILE = tern.plugin.data .. "/archived.json" -- archived session ids, with when
+
+-- Tab colors gallery.css tints a card or row with.
+local TAB_COLORS: { [string]: boolean } = {
+	red = true,
+	orange = true,
+	yellow = true,
+	green = true,
+	teal = true,
+	blue = true,
+	purple = true,
+	pink = true,
+}
 
 -- `omp` by name first, then where it gets installed: a daemon started by
 -- launchd has a PATH without Tern's own omp.
@@ -60,16 +79,14 @@ local OMP: { string } = {
 	"/usr/local/bin/omp",
 }
 
--- Lists every session file with its size and mtime in one process. Exit 3:
--- no sessions folder yet.
+-- Lists every session file, and the subagent sessions in the folder beside
+-- each, with sizes and mtimes in one process. Exit 3: no sessions folder yet.
 local LIST_SCRIPT = [[
 cd "$1" 2>/dev/null || exit 3
-set -- */*.jsonl
-[ -e "$1" ] || exit 0
 if stat --version >/dev/null 2>&1; then
-	exec stat -c '%Y %s %n' -- "$@"
+	exec find . -mindepth 2 -type f -name '*.jsonl' -exec stat -c '%Y %s %n' -- {} +
 fi
-exec stat -f '%m %z %N' -- "$@"
+exec find . -mindepth 2 -type f -name '*.jsonl' -exec stat -f '%m %z %N' -- {} +
 ]]
 
 type FileStat = {
@@ -77,6 +94,20 @@ type FileStat = {
 	size: number, -- -1 when unknown
 	mtime: number, -- seconds since the epoch; -1 when unknown
 }
+
+-- What a session file's requests spent, as omp recorded them.
+type Usage = {
+	input: number,
+	output: number,
+	cache_read: number,
+	cache_write: number,
+	tokens: number, -- all four
+	cost: number, -- US dollars at the provider's list price
+	requests: number,
+}
+
+-- A subagent's (or the advisor's) session file in a session's folder.
+type Part = { rel: string, size: number, mtime: number, usage: Usage }
 
 type Session = {
 	key: string, -- the id, made unique: node key and action value
@@ -95,6 +126,9 @@ type Session = {
 	big: boolean?, -- too large to read: only its file name is known
 	turn: number?, -- the unfinished last turn's start, epoch ms; nil once answered
 	asks: boolean?, -- that turn waits for an answer to omp's ask tool
+	usage: Usage, -- what this file's requests spent
+	spent: Usage?, -- with its subagents' sessions, worked out by rebuild
+	subagents: number?, -- how many of those
 	hay: string?, -- folded search text, built by the first search
 }
 
@@ -109,6 +143,8 @@ type State = {
 	folded: { [string]: boolean }, -- collapsed groups, by group key
 	selected: string?, -- a session key
 	pages: number,
+	archived: boolean, -- showing the archive instead of the sessions
+	confirm: string?, -- the session key a delete waits on
 }
 
 type Project = { cwd: string, count: number }
@@ -137,12 +173,16 @@ type Plan = {
 type Activity = {
 	state: string, -- "working" on a turn, "waiting" for the user's answer, or just "open"
 	since: number?, -- working: when the turn started, epoch ms, if known
+	color: string?, -- the color of the tab showing it, if any
 }
 
 -- The index, shared by every gallery block of this host.
 local sessions: { [string]: Session } = {} -- by rel
 local list: { Session } = {} -- most recently active first
 local live: { [string]: boolean } = {} -- ids a running omp holds
+local parts: { [string]: Part } = {} -- subagent session files, by rel
+local archive: { [string]: number } = {} -- archived sessions by id, with when
+local tab_colors: { [number]: string } = {} -- each pane's tab color, by pane
 -- How the window half's omp panes are doing (cx.agents:list() states, by
 -- pane), and when this half saw a pane start working, for a file not read since.
 local agents: { [number]: string } = {}
@@ -375,6 +415,66 @@ local function prompt_of(line: string): string
 	return clip(string.match(text, "^ ?(.-) ?$") or text, PROMPT_CHARS)
 end
 
+local USAGE_KEYS = { "input", "output", "cache_read", "cache_write", "tokens", "cost", "requests" }
+
+local function no_usage(): Usage
+	return { input = 0, output = 0, cache_read = 0, cache_write = 0, tokens = 0, cost = 0, requests = 0 }
+end
+
+local function add_usage(into: Usage, u: Usage)
+	into.input += u.input
+	into.output += u.output
+	into.cache_read += u.cache_read
+	into.cache_write += u.cache_write
+	into.tokens += u.tokens
+	into.cost += u.cost
+	into.requests += u.requests
+end
+
+local function copy_usage(u: Usage): Usage
+	local c = no_usage()
+	add_usage(c, u)
+	return c
+end
+
+-- A stored Usage, if it has every field.
+local function usage_from(raw: any): Usage?
+	if type(raw) ~= "table" then
+		return nil
+	end
+	for _, k in USAGE_KEYS do
+		if type(raw[k]) ~= "number" then
+			return nil
+		end
+	end
+	return {
+		input = raw.input,
+		output = raw.output,
+		cache_read = raw.cache_read,
+		cache_write = raw.cache_write,
+		tokens = raw.tokens,
+		cost = raw.cost,
+		requests = raw.requests,
+	}
+end
+
+-- Adds one request to `u`: the "usage" object of an assistant line, starting
+-- at `from` (its keys looked up, not assumed in order).
+local function count_usage(u: Usage, data: string, from: number, stop: number)
+	local chunk = string.sub(data, from, math.min(stop, from + 1023))
+	local input = tonumber(string.match(chunk, '"input":(%d+)')) or 0
+	local output = tonumber(string.match(chunk, '"output":(%d+)')) or 0
+	local cache_read = tonumber(string.match(chunk, '"cacheRead":(%d+)')) or 0
+	local cache_write = tonumber(string.match(chunk, '"cacheWrite":(%d+)')) or 0
+	u.input += input
+	u.output += output
+	u.cache_read += cache_read
+	u.cache_write += cache_write
+	u.tokens += tonumber(string.match(chunk, '"totalTokens":(%d+)')) or (input + output + cache_read + cache_write)
+	u.cost += tonumber(string.match(chunk, '"cost":{[^}]*"total":([%d%.eE+-]+)')) or 0
+	u.requests += 1
+end
+
 local function blank(f: FileStat, size: number): Session
 	local name = string.match(f.rel, "([^/]+)$") or f.rel
 	local created = utc(name, "%-") or 0
@@ -392,6 +492,7 @@ local function blank(f: FileStat, size: number): Session
 		updated = if f.mtime > 0 then f.mtime else created,
 		size = size,
 		mtime = f.mtime,
+		usage = no_usage(),
 	}
 end
 
@@ -407,6 +508,7 @@ local function parse(data: string, f: FileStat): Session
 	local last_time: string? = nil
 	local turn: number? = nil -- when the last turn started, epoch ms
 	local last_role: string? = nil -- of the last user, assistant or tool result message
+	local usage_at = 0 -- where the next "usage" object starts, as far as searched
 	local n = #data
 	local pos = 1
 	local line = 0
@@ -433,6 +535,14 @@ local function parse(data: string, f: FileStat): Session
 		elseif string.find(head, '"message":{"role":"assistant"', 1, true) then
 			assistant_at, assistant_end = pos, stop
 			last_role = "assistant"
+			-- Each search goes past the lines before its hit, so the whole
+			-- file is searched once.
+			if usage_at < pos then
+				usage_at = string.find(data, '"usage":{', pos, true) or n + 1
+			end
+			if usage_at <= stop then
+				count_usage(s.usage, data, usage_at, stop)
+			end
 		elseif string.find(head, '"message":{"role":"toolResult"', 1, true) then
 			last_role = "toolResult"
 		elseif string.find(head, '{"type":"model_change"', 1, true) then
@@ -513,8 +623,31 @@ local function read_session(f: FileStat): Session?
 	return nil -- gone since the listing, or unreadable
 end
 
--- Every session file under ROOT. `stat` gives sizes and mtimes for the cache;
--- without a shell (Windows) the folders are listed and every file is read.
+-- A subagent session file ("<project>/<session>/…/<name>.jsonl"), not a
+-- session of its own.
+local function is_part(rel: string): boolean
+	return string.match(rel, "^[^/]+/[^/]+/") ~= nil
+end
+
+-- The session file a subagent session file belongs to.
+local function parent_of(rel: string): string?
+	local folder = string.match(rel, "^([^/]+/[^/]+)/")
+	return if folder then folder .. ".jsonl" else nil
+end
+
+local function read_part(f: FileStat): Part?
+	local ok, data = pcall(tern.fs.read, ROOT .. "/" .. f.rel, MAX_FILE)
+	if ok then
+		return { rel = f.rel, size = f.size, mtime = f.mtime, usage = parse(data, f).usage }
+	elseif f.size > MAX_FILE then
+		return { rel = f.rel, size = f.size, mtime = f.mtime, usage = no_usage() }
+	end
+	return nil
+end
+
+-- Every session file under ROOT and its subagents'. `stat` gives sizes and
+-- mtimes for the cache; without a shell (Windows) the folders are listed and
+-- every file is read.
 local function list_files(done: ({ FileStat }) -> ())
 	local function by_listing()
 		local files: { FileStat } = {}
@@ -528,6 +661,23 @@ local function list_files(done: ({ FileStat }) -> ())
 			done(files)
 			return
 		end
+		-- A session's subagents and advisor keep theirs in the folder named
+		-- after its file.
+		local function walk(rel: string, depth: number)
+			local listed, names = pcall(tern.fs.list, ROOT .. "/" .. rel)
+			if not listed or depth > 4 then
+				return
+			end
+			for _, name in names do
+				if string.sub(name, 1, 1) ~= "." then
+					if string.sub(name, -6) == ".jsonl" then
+						table.insert(files, { rel = rel .. "/" .. name, size = -1, mtime = -1 })
+					else
+						walk(rel .. "/" .. name, depth + 1)
+					end
+				end
+			end
+		end
 		for _, dir in dirs do
 			if string.sub(dir, 1, 1) ~= "." then
 				local listed, names = pcall(tern.fs.list, ROOT .. "/" .. dir)
@@ -535,6 +685,7 @@ local function list_files(done: ({ FileStat }) -> ())
 					for _, name in names do
 						if string.sub(name, 1, 1) ~= "." and string.sub(name, -6) == ".jsonl" then
 							table.insert(files, { rel = dir .. "/" .. name, size = -1, mtime = -1 })
+							walk(dir .. "/" .. string.sub(name, 1, -7), 1)
 						end
 					end
 				end
@@ -554,7 +705,7 @@ local function list_files(done: ({ FileStat }) -> ())
 				else
 					local files: { FileStat } = {}
 					for row in string.gmatch(r.stdout, "[^\n]+") do
-						local mtime, size, rel = string.match(row, "^(%d+) (%d+) (.+)$")
+						local mtime, size, rel = string.match(row, "^(%d+) (%d+) %./(.+)$")
 						if rel then
 							table.insert(files, { rel = rel, size = tonumber(size) :: number, mtime = tonumber(mtime) :: number })
 						end
@@ -593,6 +744,22 @@ local function rebuild()
 		taken[key] = true
 		s.key = key
 	end
+	-- What each session spent, its subagents' sessions included.
+	for _, s in all do
+		s.spent = copy_usage(s.usage)
+		s.subagents = 0
+	end
+	for rel, p in parts do
+		local parent = parent_of(rel)
+		local s = if parent then sessions[parent] else nil
+		if s then
+			local spent = s.spent
+			if spent then
+				add_usage(spent, p.usage)
+			end
+			s.subagents = (s.subagents or 0) + 1
+		end
+	end
 	list = all
 end
 
@@ -625,8 +792,18 @@ local function load_index()
 				valid = valid and type(raw[field]) == "number"
 				s[field] = raw[field]
 			end
+			s.usage = usage_from(raw.usage)
+			valid = valid and s.usage ~= nil
 			if valid then
 				sessions[s.rel] = s :: any
+			end
+		end
+	end
+	if type(data.parts) == "table" then
+		for _, raw in data.parts do
+			local usage = if type(raw) == "table" then usage_from(raw.usage) else nil
+			if usage and type(raw.rel) == "string" and type(raw.size) == "number" and type(raw.mtime) == "number" then
+				parts[raw.rel] = { rel = raw.rel, size = raw.size, mtime = raw.mtime, usage = usage }
 			end
 		end
 	end
@@ -652,13 +829,18 @@ local function save_index()
 			big = s.big,
 			turn = s.turn,
 			asks = s.asks,
+			usage = s.usage,
 		})
+	end
+	local kept = tern.json.array()
+	for _, p in parts do
+		table.insert(kept, { rel = p.rel, size = p.size, mtime = p.mtime, usage = p.usage })
 	end
 	local ok, err = pcall(function()
 		if not tern.fs.exists(tern.plugin.data) then
 			tern.fs.mkdir(tern.plugin.data)
 		end
-		tern.fs.write(INDEX_FILE, tern.json.encode({ v = INDEX_VERSION, sessions = out }))
+		tern.fs.write(INDEX_FILE, tern.json.encode({ v = INDEX_VERSION, sessions = out, parts = kept }))
 	end)
 	if not ok then
 		tern.log.warn("omp-gallery: index not saved", err)
@@ -763,8 +945,19 @@ scan = function()
 		local todo: { FileStat } = {}
 		for _, f in files do
 			present[f.rel] = true
-			local old = sessions[f.rel]
-			if old == nil or old.size ~= f.size or old.mtime ~= f.mtime or f.mtime < 0 then
+			local size, mtime = -2, -2
+			if is_part(f.rel) then
+				local old = parts[f.rel]
+				if old then
+					size, mtime = old.size, old.mtime
+				end
+			else
+				local old = sessions[f.rel]
+				if old then
+					size, mtime = old.size, old.mtime
+				end
+			end
+			if size ~= f.size or mtime ~= f.mtime or f.mtime < 0 then
 				table.insert(todo, f)
 			end
 		end
@@ -775,12 +968,23 @@ scan = function()
 				table.insert(gone, rel)
 			end
 		end
+		for rel in parts do
+			if not present[rel] then
+				table.insert(gone, rel)
+			end
+		end
 		for _, rel in gone do
 			sessions[rel] = nil
+			parts[rel] = nil
 			changed = true
 		end
-		-- Newest first, so the sessions people look for show up first.
+		-- Sessions before subagents, newest first, so the sessions people look
+		-- for show up first.
 		table.sort(todo, function(a: FileStat, b: FileStat): boolean
+			local pa, pb = is_part(a.rel), is_part(b.rel)
+			if pa ~= pb then
+				return pb
+			end
 			return a.mtime > b.mtime
 		end)
 		todo_count = #todo
@@ -791,13 +995,24 @@ scan = function()
 			while i <= #todo and tern.now() - start < SLICE_MS do
 				local f = todo[i]
 				i += 1
-				local ok, s = pcall(read_session, f)
-				if not ok then
-					tern.log.warn("omp-gallery: could not read", f.rel, s)
-				elseif s then
-					sessions[f.rel] = s
+				if is_part(f.rel) then
+					local ok, p = pcall(read_part, f)
+					if not ok then
+						tern.log.warn("omp-gallery: could not read", f.rel, p)
+					elseif p then
+						parts[f.rel] = p
+					else
+						parts[f.rel] = nil
+					end
 				else
-					sessions[f.rel] = nil
+					local ok, s = pcall(read_session, f)
+					if not ok then
+						tern.log.warn("omp-gallery: could not read", f.rel, s)
+					elseif s then
+						sessions[f.rel] = s
+					else
+						sessions[f.rel] = nil
+					end
 				end
 				done_count += 1
 			end
@@ -837,29 +1052,46 @@ local function refresh(force: boolean)
 	end
 end
 
--- The window half's report of how its omp panes are doing (JSON, state by pane
--- id), sent when the gallery gets focus and whenever a state changes. True
--- when a state changed.
-local function take_agents(value: any): boolean
+-- The window half's report of its panes (JSON): how each omp pane is doing
+-- (`states`, as cx.agents:list() says) and each pane's tab color (`colors`).
+-- Sent when the gallery gets focus and whenever an agent's state changes.
+-- True when something changed.
+local function take_report(value: any): boolean
 	local data = if type(value) == "string" then decode(value) else nil
-	if type(data) ~= "table" then
+	if data == nil then
 		return false
 	end
+	local changed = false
+	local colors: { [number]: string } = {}
+	if type(data.colors) == "table" then
+		for id, color in data.colors do
+			local pane = tonumber(id)
+			if pane and type(color) == "string" and TAB_COLORS[color] then
+				colors[pane] = color
+				changed = changed or tab_colors[pane] ~= color
+			end
+		end
+	end
+	for pane in tab_colors do
+		changed = changed or colors[pane] == nil
+	end
+	tab_colors = colors
 	local now = now_ms()
 	local fresh: { [number]: string } = {}
-	local changed = false
-	for id, st in data do
-		local pane = tonumber(id)
-		if pane and type(st) == "string" then
-			fresh[pane] = st
-			local was = agents[pane]
-			if st ~= was then
-				changed = true
-				-- A turn seen starting; one under way before the first report has no start here.
-				if st == "working" and was ~= nil then
-					went[pane] = now
-				else
-					went[pane] = nil
+	if type(data.states) == "table" then
+		for id, st in data.states do
+			local pane = tonumber(id)
+			if pane and type(st) == "string" then
+				fresh[pane] = st
+				local was = agents[pane]
+				if st ~= was then
+					changed = true
+					-- A turn seen starting; one under way before the first report has no start here.
+					if st == "working" and was ~= nil then
+						went[pane] = now
+					else
+						went[pane] = nil
+					end
 				end
 			end
 		end
@@ -886,6 +1118,41 @@ local function refresh_soon()
 	end)
 end
 
+-- The archive: sessions put away, by id (a file without one goes by its
+-- path), with when. They show only under the Archived button.
+local function archive_key(s: Session): string
+	return if s.id ~= "" then s.id else s.rel
+end
+
+local function is_archived(s: Session): boolean
+	return archive[archive_key(s)] ~= nil
+end
+
+local function load_archive()
+	local ok, data = pcall(function(): any
+		return tern.json.decode(tern.fs.read(ARCHIVE_FILE, 16 * 1024 * 1024))
+	end)
+	if ok and type(data) == "table" then
+		for id, at in data do
+			if type(id) == "string" and type(at) == "number" then
+				archive[id] = at
+			end
+		end
+	end
+end
+
+local function save_archive()
+	local ok, err = pcall(function()
+		if not tern.fs.exists(tern.plugin.data) then
+			tern.fs.mkdir(tern.plugin.data)
+		end
+		tern.fs.write(ARCHIVE_FILE, tern.json.encode(archive))
+	end)
+	if not ok then
+		tern.log.warn("omp-gallery: archive not saved", err)
+	end
+end
+
 -- Filtering and selection ----------------------------------------------------
 
 local function hay(s: Session): string
@@ -898,7 +1165,8 @@ local function hay(s: Session): string
 	return text
 end
 
--- The sessions the query and the project filter let through, newest first.
+-- The sessions the query, the project filter and the archive button let
+-- through, newest first.
 local function filtered(state: State): { Session }
 	local terms: { string } = {}
 	for term in string.gmatch(fold(state.query), "%S+") do
@@ -906,7 +1174,7 @@ local function filtered(state: State): { Session }
 	end
 	local out: { Session } = {}
 	for _, s in list do
-		if state.project == ALL or s.cwd == state.project then
+		if (state.project == ALL or s.cwd == state.project) and is_archived(s) == state.archived then
 			local text = hay(s)
 			local hit = true
 			for _, term in terms do
@@ -1027,6 +1295,7 @@ local function activities(): { [string]: Activity }
 			out[s.key] = {
 				state = state,
 				since = if state ~= "working" then nil elseif s.turn then s.turn elseif pane then went[pane] else nil,
+				color = if pane then tab_colors[pane] else nil,
 			}
 		end
 	end
@@ -1264,6 +1533,140 @@ local function has_mod(ev: UiEvent, mod: string): boolean
 	return type(ev.mods) == "table" and table.find(ev.mods, mod) ~= nil
 end
 
+-- Archive and delete --------------------------------------------------------
+
+-- A session's title as people read it.
+local function display_title(s: Session): string
+	local _, _, text = split_title(s.title)
+	return if text ~= "" then text else "Untitled session"
+end
+
+local function archived_count(): number
+	local n = 0
+	for _, s in list do
+		if is_archived(s) then
+			n += 1
+		end
+	end
+	return n
+end
+
+local function toggle_archive(cx: BlockCx, s: Session)
+	local id = archive_key(s)
+	if archive[id] then
+		archive[id] = nil
+		cx:toast("success", "Unarchived", display_title(s))
+	else
+		archive[id] = os.time()
+		cx:toast("success", "Archived", display_title(s) .. ": the Archived button shows it again.")
+	end
+	save_archive()
+	render_all()
+end
+
+-- Whether omp holds `s` now: a running omp leases it or a pane shows it.
+local function held_now(s: Session): boolean
+	return live[s.id] == true or activities()[s.key] ~= nil
+end
+
+-- Removes a session for good: its file, the folder beside it (subagents,
+-- advisor, tool output), its lock file, and its project's folder once empty.
+local function delete_session(cx: BlockCx, s: Session)
+	local file = ROOT .. "/" .. s.rel
+	local folder = string.sub(file, 1, -7)
+	local lock = (string.gsub(file, "([^/]+)$", ".%1.lock.os"))
+	local ok, err = pcall(function()
+		tern.fs.remove(file)
+		for _, path in { folder, lock } do
+			if tern.fs.exists(path) then
+				tern.fs.remove(path)
+			end
+		end
+	end)
+	if not ok then
+		cx:toast("error", "Couldn't delete the session", tostring(err))
+		refresh(true)
+		return
+	end
+	-- omp makes the project's folder again for its next session there.
+	pcall(function()
+		local project = string.match(file, "^(.*)/[^/]+$") :: string
+		if #tern.fs.list(project) == 0 then
+			tern.fs.remove(project)
+		end
+	end)
+	sessions[s.rel] = nil
+	local inside = string.sub(s.rel, 1, -7) .. "/"
+	local gone: { string } = {}
+	for rel in parts do
+		if string.sub(rel, 1, #inside) == inside then
+			table.insert(gone, rel)
+		end
+	end
+	for _, rel in gone do
+		parts[rel] = nil
+	end
+	if archive[archive_key(s)] then
+		archive[archive_key(s)] = nil
+		save_archive()
+	end
+	rebuild()
+	save_index()
+	render_all()
+	cx:toast("success", "Deleted", display_title(s))
+end
+
+local HELD_TITLE = "omp has this session open"
+local HELD_TEXT = "Close it in omp first, then delete it."
+
+-- Asks before deleting `s`, with the strip in the dock.
+local function ask_delete(state: State, cx: BlockCx, s: Session?): boolean
+	if s == nil then
+		return false
+	end
+	if held_now(s) then
+		cx:toast("info", HELD_TITLE, HELD_TEXT)
+		return true
+	end
+	state.selected = s.key
+	state.confirm = s.key
+	return true
+end
+
+-- The delete the strip asked about, confirmed.
+local function erase(state: State, cx: BlockCx)
+	local s = find(state.confirm)
+	state.confirm = nil
+	if s == nil then
+		return
+	end
+	if held_now(s) then
+		cx:toast("info", HELD_TITLE, HELD_TEXT)
+		return
+	end
+	delete_session(cx, s)
+end
+
+-- The dock's question before a delete: Escape cancels, Enter deletes.
+local function confirm_strip(s: Session): Node
+	return ui.node("card", {
+		key = "confirm",
+		tone = "error",
+		icon = "trash",
+		head = "Delete “" .. display_title(s) .. "”?",
+		["end"] = "dock.confirm.end",
+	}, {
+		ui.node("row", { key = "end", gap = "sm" }, {
+			ui.button("Cancel", { key = "cancel", variant = "quiet", size = "sm", keys = { "esc" }, actions = { click = "cancel" } }),
+			ui.button("Delete", { key = "go", variant = "danger", size = "sm", keys = { "enter" }, actions = { click = "erase" } }),
+		}),
+		ui.node("text", {
+			key = "what",
+			spans = { ui.span("Its transcript, subagents and tool output are deleted for good; omp can't resume it afterwards.", "muted") },
+		}),
+	})
+end
+
 -- The view ----------------------------------------------------------------------
 
 local function head_row(): Node
@@ -1335,6 +1738,7 @@ local function project_options(): { any }
 end
 
 local function toolbar(state: State): Node
+	local stored = archived_count()
 	return ui.node("row", { key = "bar", gap = "sm", align = "center" }, {
 		ui.node("input", {
 			key = "search",
@@ -1371,6 +1775,14 @@ local function toolbar(state: State): Node
 			active = state.view,
 			items = { { id = "cards", label = "Cards" }, { id = "list", label = "List" } },
 		}),
+		ui.button(if stored > 0 then "Archived " .. group(stored) else "Archived", {
+			key = "archived",
+			icon = "inbox",
+			variant = "quiet",
+			on = state.archived,
+			title = if state.archived then "Back to your sessions" else "Show archived sessions",
+			actions = { click = "archived" },
+		}),
 	})
 end
 
@@ -1404,7 +1816,65 @@ local function card_menu(s: Session, held: boolean): { any }
 		},
 		{ id = "copyid=" .. s.key, label = "Copy session ID", icon = "copy" },
 		{ id = "copycmd=" .. s.key, label = "Copy resume command", icon = "terminal" },
+		"-",
+		{
+			id = "archive=" .. s.key,
+			label = if is_archived(s) then "Unarchive" else "Archive",
+			icon = "inbox",
+			keys = { "ctrl", "e" },
+		},
+		{
+			id = "delete=" .. s.key,
+			label = "Delete…",
+			icon = "trash",
+			danger = true,
+			keys = { "ctrl", "d" },
+			disabled = if held then "Close it in omp first" else false,
+		},
 	}
+end
+
+-- Money at list prices: "$4.21", "<$0.01", "$1,234".
+local function money(n: number): string
+	if n <= 0 then
+		return "$0"
+	elseif n < 0.01 then
+		return "<$0.01"
+	elseif n < 1000 then
+		return string.format("$%.2f", n)
+	end
+	return "$" .. group(n)
+end
+
+-- What a session spent, its subagents included: the hovercard of its spend.
+local function spend_card(s: Session): Node
+	local u = s.spent or s.usage
+	local items: { any } = {
+		{ k = "Cost", v = { ui.span(money(u.cost), "strong") } },
+		{ k = "Tokens", v = { ui.span(group(u.tokens), "mono") } },
+		{ k = "Input", v = { ui.span(group(u.input), "mono") } },
+		{ k = "Output", v = { ui.span(group(u.output), "mono") } },
+		{ k = "Cache read", v = { ui.span(group(u.cache_read), "mono") } },
+		{ k = "Cache write", v = { ui.span(group(u.cache_write), "mono") } },
+		{ k = "Requests", v = { ui.span(group(u.requests), "mono") } },
+	}
+	local helpers = s.subagents or 0
+	if helpers > 0 then
+		table.insert(items, {
+			k = "Subagents",
+			v = { ui.span(money(u.cost - s.usage.cost), "mono"), ui.span(" in " .. count(helpers, "session"), "muted") },
+		})
+	end
+	return ui.node("col", { gap = "sm" }, {
+		ui.node("text", { spans = { ui.span("Spent on this session", "strong") } }),
+		ui.node("kv", { items = items }),
+		ui.node("text", { spans = { ui.span("At list prices, as omp recorded them", "dim") } }),
+	})
+end
+
+-- The role gallery.css tints a session's card or row by, with its tab's color.
+local function tab_role(a: Activity?): string?
+	return if a and a.color then "omp-gallery.tab-" .. a.color else nil
 end
 
 local function footer(s: Session): Node
@@ -1430,6 +1900,10 @@ local function footer(s: Session): Node
 		wrap = "none",
 		spans = { ui.span(count(s.prompts, "prompt"), "muted"), ui.span(" · " .. size_text(s.size), "dim") },
 	}))
+	local u = s.spent or s.usage
+	if u.requests > 0 then
+		table.insert(kids, ui.node("badge", { key = "spent", text = money(u.cost), hovercard = spend_card(s) }))
+	end
 	return ui.node("row", { key = "foot", gap = "sm", align = "center" }, kids)
 end
 
@@ -1484,6 +1958,7 @@ local function session_card(s: Session, id: string, selected: boolean, a: Activi
 		selected = selected,
 		grow = 1,
 		basis = 0,
+		role = tab_role(a),
 		actions = { click = "pick=" .. s.key, dblclick = "open=" .. s.key, menu = card_menu(s, a ~= nil) },
 	}
 	local kids: { Node } = {}
@@ -1543,6 +2018,10 @@ local function session_item(s: Session, a: Activity?): Node
 	elseif a then
 		table.insert(value, ui.span("Open · "))
 	end
+	local u = s.spent or s.usage
+	if u.requests > 0 then
+		table.insert(value, ui.span(money(u.cost) .. " · ", "mono"))
+	end
 	table.insert(value, ui.span(ago(s.updated), "muted"))
 	return ui.node("item", {
 		key = s.key,
@@ -1550,6 +2029,8 @@ local function session_item(s: Session, a: Activity?): Node
 		detail = detail,
 		value = value,
 		icon = if s.provider ~= "" then "provider:" .. s.provider else "app-omp",
+		role = tab_role(a),
+		hovercard = if u.requests > 0 then spend_card(s) else nil,
 		actions = { click = "pick=" .. s.key, dblclick = "open=" .. s.key, menu = card_menu(s, a ~= nil) },
 	})
 end
@@ -1691,6 +2172,11 @@ end
 
 local function nothing(state: State): Node
 	if #list > 0 then
+		if state.archived and state.query == "" then
+			return ui.node("empty", { key = "grid", variant = "inline", frame = true, icon = "inbox", text = "No archived sessions" }, {
+				ui.button("Back to sessions", { key = "back", variant = "quiet", size = "sm", keys = { "esc" }, actions = { click = "archived" } }),
+			})
+		end
 		local text = if state.query ~= "" then "Nothing matches “" .. state.query .. "”" else "No sessions here"
 		return ui.node("empty", { key = "grid", variant = "inline", frame = true, icon = "search", text = text }, {
 			ui.button("Clear", { key = "reset", variant = "quiet", size = "sm", keys = { "esc" }, actions = { click = "reset" } }),
@@ -1727,6 +2213,8 @@ local function legend(): Node
 		{ "tab", "project" },
 		{ "ctrl+g", "group" },
 		{ "ctrl+l", "cards/list" },
+		{ "ctrl+e", "archive" },
+		{ "ctrl+d", "delete" },
 		{ "esc", "clear" },
 		{ "ctrl+r", "refresh" },
 	}
@@ -1788,7 +2276,15 @@ local function view(state: State, cx: BlockCx): BlockView
 	else
 		table.insert(main, nothing(state))
 	end
-	return { main = ui.node("col", { gap = "md" }, main), dock = ui.col({ legend() }) }
+	local dock: { Node } = {}
+	local doomed = if state.confirm then find(state.confirm) else nil
+	if doomed then
+		table.insert(dock, confirm_strip(doomed))
+	else
+		state.confirm = nil
+	end
+	table.insert(dock, legend())
+	return { main = ui.node("col", { gap = "md" }, main), dock = ui.col(dock) }
 end
 
 -- Keys ------------------------------------------------------------------------
@@ -1817,6 +2313,16 @@ end
 
 local function key(state: State, k: Key, cx: BlockCx): boolean?
 	local name = k.name
+	-- The delete question takes Enter and Escape while it shows.
+	if state.confirm and not (k.meta or k.ctrl or k.alt) then
+		if name == "enter" then
+			erase(state, cx)
+			return true
+		elseif name == "escape" then
+			state.confirm = nil
+			return true
+		end
+	end
 	if k.meta then
 		if name == "backspace" and state.query ~= "" then
 			set_query(state, "")
@@ -1837,6 +2343,14 @@ local function key(state: State, k: Key, cx: BlockCx): boolean?
 			set_layout(state, state.view, cycle(GROUPINGS, state.grouping, if k.shift then -1 else 1))
 		elseif name == "l" then
 			set_layout(state, cycle(VIEWS, state.view, 1), state.grouping)
+		elseif name == "e" or name == "d" then
+			local s = chosen(state, plan(state, cx, activities()))
+			if s == nil then
+				return false
+			elseif name == "d" then
+				return ask_delete(state, cx, s)
+			end
+			toggle_archive(cx, s)
 		else
 			return false
 		end
@@ -1867,6 +2381,9 @@ local function key(state: State, k: Key, cx: BlockCx): boolean?
 			set_query(state, "")
 		elseif state.project ~= ALL then
 			state.project = ALL
+			state.pages = 1
+		elseif state.archived then
+			state.archived = false
 			state.pages = 1
 		else
 			return false
@@ -1904,11 +2421,11 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 		local act = ev.act
 		local s = find(if type(ev.value) == "string" then ev.value else nil)
 		if act == "wake" then
-			take_agents(ev.value)
+			take_report(ev.value)
 			refresh(false) -- the window half: the gallery got focus
 		elseif act == "agents" then
 			-- The window half: an omp pane started or ended a turn.
-			if take_agents(ev.value) then
+			if take_report(ev.value) then
 				render_all()
 				refresh_soon()
 			end
@@ -1928,6 +2445,13 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 		elseif act == "only" and type(ev.value) == "string" then
 			state.project = ev.value
 			state.pages = 1
+		elseif act == "archived" then
+			state.archived = not state.archived
+			state.pages = 1
+		elseif act == "cancel" then
+			state.confirm = nil
+		elseif act == "erase" then
+			erase(state, cx)
 		elseif s == nil then
 			return
 		elseif act == "pick" then
@@ -1946,6 +2470,10 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 			local command = common.resume_command(ROOT .. "/" .. s.rel)
 			cx:copy(command)
 			cx:toast("success", "Copied the resume command", command)
+		elseif act == "archive" then
+			toggle_archive(cx, s)
+		elseif act == "delete" then
+			ask_delete(state, cx, s)
 		end
 	elseif ev.ev == "change" and ev.id == PROJECT_ID and type(ev.value) == "string" then
 		state.project = ev.value
@@ -1969,6 +2497,7 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 end
 
 load_index()
+load_archive()
 
 tern.block.define("gallery", {
 	font = "sans",
@@ -1999,12 +2528,21 @@ tern.block.define("gallery", {
 			folded = folded,
 			selected = nil,
 			pages = 1,
+			archived = false,
+			confirm = nil,
 		}
 		running[cx.pane] = state
 		refresh(true)
 		-- Draw first, so the field the focus op names exists.
 		cx:render()
 		cx:frame({ { "focus", SEARCH_ID } })
+		-- The window half's report (agents, tab colors) comes with focus and
+		-- agent changes; ask for one now, once that half has loaded too.
+		tern.timer(REPORT_MS, function()
+			if running[cx.pane] == state then
+				cx:open(common.link("report", {}))
+			end
+		end)
 		return state
 	end,
 
