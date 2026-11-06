@@ -5,9 +5,11 @@
 -- Session files (~/.omp/agent/sessions/<project>/<time>_<id>.jsonl) are read
 -- a few at a time on timer ticks and cached by size and mtime in
 -- <data>/index.json, so a refresh reads only the sessions that changed.
--- A session shows as running while an omp holds it (`omp session lease`) or
--- an omp pane is titled after it. Resuming one is the window's business (a
--- new tab), asked for with an `omp-gallery://` link.
+-- A session omp holds shows what omp does with it: working on a turn (and
+-- for how long), waiting for the user's answer, or just open. The window half
+-- reports how its omp panes are doing; a session only an omp elsewhere holds
+-- (`omp session lease`) goes by its file. Resuming one is the window's
+-- business (a new tab), asked for with an `omp-gallery://` link.
 --
 -- Keys: type to search, ←↑↓→ move, Enter resumes in a new tab (⌥Enter: in a
 -- split), ⌃N starts a new session in a folder you pick, Tab/⇧Tab cycle the
@@ -21,13 +23,15 @@ local ui = tern.ui
 local HOME = tern.getenv("HOME") or ""
 local ROOT = HOME .. "/.omp/agent/sessions"
 local INDEX_FILE = tern.plugin.data .. "/index.json"
-local INDEX_VERSION = 1
+local INDEX_VERSION = 2
 
 local MAX_FILE = 160 * 1024 * 1024 -- larger session files are listed, not read
 local HEAD = 320 -- bytes at the start of a line that say what it is
 local PROMPT_CHARS = 280
 local SLICE_MS = 120 -- parsing per timer tick
 local WAKE_MS = 5000 -- a focus refresh this soon after the last scan is skipped
+local SOON_MS = 400 -- after an agent's turn starts or ends, until its file shows it
+local TICK_MS = 20000 -- how often a list showing working sessions redraws their minutes
 
 local PAGE = 24 -- cards per page: whole rows at 1 to 4 columns
 local LIST_PAGE = 60 -- list rows per page
@@ -89,6 +93,8 @@ type Session = {
 	size: number,
 	mtime: number,
 	big: boolean?, -- too large to read: only its file name is known
+	turn: number?, -- the unfinished last turn's start, epoch ms; nil once answered
+	asks: boolean?, -- that turn waits for an answer to omp's ask tool
 	hay: string?, -- folded search text, built by the first search
 }
 
@@ -127,10 +133,22 @@ type Plan = {
 	total: number, -- sessions outside folded groups
 }
 
+-- What omp does with a session it holds.
+type Activity = {
+	state: string, -- "working" on a turn, "waiting" for the user's answer, or just "open"
+	since: number?, -- working: when the turn started, epoch ms, if known
+}
+
 -- The index, shared by every gallery block of this host.
 local sessions: { [string]: Session } = {} -- by rel
 local list: { Session } = {} -- most recently active first
 local live: { [string]: boolean } = {} -- ids a running omp holds
+-- How the window half's omp panes are doing (cx.agents:list() states, by
+-- pane), and when this half saw a pane start working, for a file not read since.
+local agents: { [number]: string } = {}
+local went: { [number]: number } = {}
+local soon = false -- a refresh after an agent state change is on its way
+local ticking = false -- a redraw of the working minutes in lists is on its way
 local scanning = false
 local again = false -- a forced refresh came in during a scan
 local done_count, todo_count = 0, 0
@@ -181,6 +199,29 @@ local function utc(s: string, sep: string): number?
 		tonumber(mm) :: number,
 		tonumber(ss) :: number
 	)
+end
+
+-- An ISO 8601 UTC time in milliseconds since the epoch.
+local function utc_ms(s: string): number?
+	local t = utc(s, ":")
+	if t == nil then
+		return nil
+	end
+	local frac = string.match(s, "^[^.]+%.(%d+)")
+	return t * 1000 + (if frac then tonumber(string.sub(frac .. "00", 1, 3)) or 0 else 0)
+end
+
+-- Wall-clock milliseconds since the epoch. os.time() counts whole seconds, so
+-- the monotonic clock carries the fraction; a jump (sleep, a clock change)
+-- anchors it again.
+local clock_base = os.time() * 1000 - tern.now()
+local function now_ms(): number
+	local ms = clock_base + tern.now()
+	if math.abs(ms - os.time() * 1000) > 2000 then
+		clock_base = os.time() * 1000 - tern.now()
+		ms = clock_base + tern.now()
+	end
+	return ms
 end
 
 local function ago(t: number): string
@@ -364,6 +405,8 @@ local function parse(data: string, f: FileStat): Session
 	local assistant_at, assistant_end = 0, 0
 	local switched: string? = nil
 	local last_time: string? = nil
+	local turn: number? = nil -- when the last turn started, epoch ms
+	local last_role: string? = nil -- of the last user, assistant or tool result message
 	local n = #data
 	local pos = 1
 	local line = 0
@@ -381,8 +424,17 @@ local function parse(data: string, f: FileStat): Session
 			if first_user == nil then
 				first_user = string.sub(data, pos, stop)
 			end
+			-- A prompt after an answer starts a turn; one sent while the agent
+			-- worked (after a tool result) joins that turn.
+			if turn == nil or last_role == "assistant" then
+				turn = if at then utc_ms(at) else nil
+			end
+			last_role = "user"
 		elseif string.find(head, '"message":{"role":"assistant"', 1, true) then
 			assistant_at, assistant_end = pos, stop
+			last_role = "assistant"
+		elseif string.find(head, '"message":{"role":"toolResult"', 1, true) then
+			last_role = "toolResult"
 		elseif string.find(head, '{"type":"model_change"', 1, true) then
 			switched = string.match(head, '"model":"([^"]+)"') or switched
 		elseif string.find(head, '{"type":"title_change"', 1, true) then
@@ -418,13 +470,8 @@ local function parse(data: string, f: FileStat): Session
 	if first_user then
 		s.prompt = prompt_of(first_user)
 	end
-	local provider, model
-	if assistant_at > 0 then
-		provider, model = string.match(
-			string.sub(data, assistant_at, assistant_end),
-			'"provider":"([^"]*)","model":"([^"]*)"'
-		)
-	end
+	local answer = if assistant_at > 0 then string.sub(data, assistant_at, assistant_end) else ""
+	local provider, model = string.match(answer, '"provider":"([^"]*)","model":"([^"]*)"')
 	if provider and provider ~= "" then
 		s.provider, s.model = provider, model or ""
 	elseif switched then
@@ -438,6 +485,17 @@ local function parse(data: string, f: FileStat): Session
 	local updated = if last_time then utc(last_time, ":") else nil
 	if updated then
 		s.updated = updated
+	end
+	-- The last turn goes on unless the agent's last answer ended it; one that
+	-- stopped to call omp's ask tool waits for the user.
+	if turn and last_role then
+		local reason = if last_role == "assistant" then string.match(answer, '.*"stopReason":"(%a+)"') else nil
+		if last_role ~= "assistant" or reason == "toolUse" then
+			s.turn = turn
+			s.asks = if reason == "toolUse" and string.find(answer, '"type":"toolCall","id":"[^"]*","name":"ask"')
+				then true
+				else nil
+		end
 	end
 	return s
 end
@@ -552,7 +610,12 @@ local function load_index()
 	end
 	for _, raw in data.sessions do
 		if type(raw) == "table" then
-			local s: { [string]: any } = { key = "", big = if raw.big == true then true else nil }
+			local s: { [string]: any } = {
+				key = "",
+				big = if raw.big == true then true else nil,
+				turn = if type(raw.turn) == "number" then raw.turn else nil,
+				asks = if raw.asks == true then true else nil,
+			}
 			local valid = true
 			for _, field in STRINGS do
 				valid = valid and type(raw[field]) == "string"
@@ -587,6 +650,8 @@ local function save_index()
 			size = s.size,
 			mtime = s.mtime,
 			big = s.big,
+			turn = s.turn,
+			asks = s.asks,
 		})
 	end
 	local ok, err = pcall(function()
@@ -626,6 +691,19 @@ local function render_all()
 			state.cx:render()
 		end
 	end
+end
+
+-- List rows can't hold a live timer: while one shows how long a session has
+-- been working, redraw it now and then.
+local function tick_later()
+	if ticking then
+		return
+	end
+	ticking = true
+	tern.timer(TICK_MS, function()
+		ticking = false
+		render_all()
+	end)
 end
 
 -- Asks omp which of the sessions a running omp holds.
@@ -759,6 +837,55 @@ local function refresh(force: boolean)
 	end
 end
 
+-- The window half's report of how its omp panes are doing (JSON, state by pane
+-- id), sent when the gallery gets focus and whenever a state changes. True
+-- when a state changed.
+local function take_agents(value: any): boolean
+	local data = if type(value) == "string" then decode(value) else nil
+	if type(data) ~= "table" then
+		return false
+	end
+	local now = now_ms()
+	local fresh: { [number]: string } = {}
+	local changed = false
+	for id, st in data do
+		local pane = tonumber(id)
+		if pane and type(st) == "string" then
+			fresh[pane] = st
+			local was = agents[pane]
+			if st ~= was then
+				changed = true
+				-- A turn seen starting; one under way before the first report has no start here.
+				if st == "working" and was ~= nil then
+					went[pane] = now
+				else
+					went[pane] = nil
+				end
+			end
+		end
+	end
+	for pane in agents do
+		if fresh[pane] == nil then
+			changed = true
+			went[pane] = nil
+		end
+	end
+	agents = fresh
+	return changed
+end
+
+-- After a turn starts or ends, reads the files that changed once they show it.
+local function refresh_soon()
+	if soon then
+		return
+	end
+	soon = true
+	tern.timer(SOON_MS, function()
+		soon = false
+		refresh(true)
+	end)
+end
+
 -- Filtering and selection ----------------------------------------------------
 
 local function hay(s: Session): string
@@ -862,14 +989,14 @@ local function cycle_project(state: State, step: number)
 	state.pages = 1
 end
 
--- Sessions an omp pane on this host shows (see common.shows), by key.
-local function on_screen(): { [string]: boolean }
-	local open: { [string]: boolean } = {}
+-- The omp pane on this host showing each session (see common.shows), by key.
+local function on_screen(): { [string]: number }
+	local open: { [string]: number } = {}
 	local panes = tern.pane.list()
 	for _, s in list do
 		for _, p in panes do
 			if common.shows(p.title, p.cwd, s.title, s.cwd) then
-				open[s.key] = true
+				open[s.key] = p.pane
 				break
 			end
 		end
@@ -877,8 +1004,33 @@ local function on_screen(): { [string]: boolean }
 	return open
 end
 
-local function is_held(s: Session, open: { [string]: boolean }): boolean
-	return live[s.id] == true or open[s.key] == true
+-- What omp does with each session it holds, by key. The window half's report
+-- says how an omp pane is doing; a session an omp elsewhere leases, or one in
+-- a pane not reported yet, goes by its file.
+local function activities(): { [string]: Activity }
+	local panes = on_screen()
+	local out: { [string]: Activity } = {}
+	for _, s in list do
+		local pane = panes[s.key]
+		local reported = if pane then agents[pane] else nil
+		local state: string? = nil
+		if reported == "working" then
+			state = "working"
+		elseif reported == "waiting_input" then
+			state = "waiting"
+		elseif reported == "idle" then
+			state = "open"
+		elseif live[s.id] or (pane and reported == nil) then
+			state = if s.turn == nil then "open" elseif s.asks then "waiting" else "working"
+		end
+		if state then
+			out[s.key] = {
+				state = state,
+				since = if state ~= "working" then nil elseif s.turn then s.turn elseif pane then went[pane] else nil,
+			}
+		end
+	end
+	return out
 end
 
 local function page_size(state: State): number
@@ -900,7 +1052,7 @@ local function today(): number
 	return os.time({ year = now.year, month = now.month, day = now.day, hour = 0, min = 0, sec = 0 })
 end
 
--- The "last active" groups between "Running now" and "Older": a session
+-- The "last active" groups between the ones omp holds and "Older": a session
 -- last active on or after `days` days before today goes in the first that
 -- takes it.
 local SPANS = {
@@ -910,7 +1062,7 @@ local SPANS = {
 	{ key = "month", title = "Last 30 days", days = 29 },
 }
 
-local function groups_of(state: State, shown: { Session }, open: { [string]: boolean }): { Group }
+local function groups_of(state: State, shown: { Session }, doing: { [string]: Activity }): { Group }
 	if state.grouping == "workspace" then
 		local names = project_names()
 		local by: { [string]: Group } = {}
@@ -932,7 +1084,13 @@ local function groups_of(state: State, shown: { Session }, open: { [string]: boo
 		end
 		return out
 	elseif state.grouping == "time" then
-		local groups: { Group } = { { key = "trunning", title = "Running now", sessions = {}, drawn = 0 } }
+		-- What omp does with a session first, then when it was last active.
+		local groups: { Group } = {
+			{ key = "tworking", title = "Working now", sessions = {}, drawn = 0 },
+			{ key = "twaiting", title = "Waiting for you", sessions = {}, drawn = 0 },
+			{ key = "topen", title = "Open", sessions = {}, drawn = 0 },
+		}
+		local held = #groups
 		for _, span in SPANS do
 			table.insert(groups, { key = "t" .. span.key, title = span.title, sessions = {}, drawn = 0 })
 		end
@@ -940,12 +1098,13 @@ local function groups_of(state: State, shown: { Session }, open: { [string]: boo
 		local start = today()
 		for _, s in shown do
 			local into = groups[#groups]
-			if is_held(s, open) then
-				into = groups[1]
+			local a = doing[s.key]
+			if a then
+				into = groups[if a.state == "working" then 1 elseif a.state == "waiting" then 2 else 3]
 			else
 				for i, span in SPANS do
 					if s.updated >= start - span.days * 86400 then
-						into = groups[i + 1]
+						into = groups[held + i]
 						break
 					end
 				end
@@ -965,13 +1124,13 @@ end
 
 -- Folded groups draw their heading only; sessions past the pages shown wait
 -- behind the pager.
-local function plan(state: State, cx: BlockCx, open: { [string]: boolean }): Plan
+local function plan(state: State, cx: BlockCx, doing: { [string]: Activity }): Plan
 	local shown = filtered(state)
 	local cols = if state.view == "list" then 1 else columns(cx)
 	local limit = state.pages * page_size(state)
 	local p: Plan = {
 		shown = shown,
-		groups = groups_of(state, shown, open),
+		groups = groups_of(state, shown, doing),
 		cols = cols,
 		order = {},
 		rows = {},
@@ -1010,8 +1169,8 @@ end
 -- Moves the selection `n` sessions, or `n` rows of cards with `rows`. Moving
 -- past the last one drawn shows the next page.
 local function move(state: State, cx: BlockCx, n: number, rows: boolean): boolean
-	local open = on_screen()
-	local p = plan(state, cx, open)
+	local doing = activities()
+	local p = plan(state, cx, doing)
 	if #p.order == 0 then
 		return false
 	end
@@ -1027,7 +1186,7 @@ local function move(state: State, cx: BlockCx, n: number, rows: boolean): boolea
 	local past = if rows then r + n > #p.rows else i + n > #p.order
 	if past and p.total > #p.order then
 		state.pages = if n == math.huge then math.ceil(p.total / page_size(state)) else state.pages + 1
-		p = plan(state, cx, open)
+		p = plan(state, cx, doing)
 	end
 	local target = math.clamp(i + n, 1, #p.order)
 	if rows then
@@ -1219,7 +1378,7 @@ local function card_menu(s: Session, held: boolean): { any }
 	return {
 		{
 			id = "open=" .. s.key,
-			label = if held then "Show running session" else "Resume in new tab",
+			label = if held then "Show open session" else "Resume in new tab",
 			icon = "play",
 			keys = { "enter" },
 		},
@@ -1274,7 +1433,39 @@ local function footer(s: Session): Node
 	return ui.node("row", { key = "foot", gap = "sm", align = "center" }, kids)
 end
 
-local function session_card(s: Session, id: string, selected: boolean, held: boolean): Node
+-- How long, in minutes: "<1m", "4m", "1h 05m".
+local function minutes(ms: number): string
+	local m = ms // 60000
+	if m < 1 then
+		return "<1m"
+	elseif m < 60 then
+		return string.format("%dm", m)
+	end
+	return string.format("%dh %02dm", m // 60, m % 60)
+end
+
+-- A held session's marks: what omp does with it and, while it works, a live
+-- timer of the turn.
+local function activity_marks(a: Activity?): { Node }
+	if a == nil then
+		return {}
+	elseif a.state == "working" then
+		local marks: { Node } = {
+			ui.node("badge", { key = "doing", text = "Working", tone = "pending", title = "omp is working on a turn" }),
+		}
+		if a.since then
+			table.insert(marks, ui.node("elapsed", { key = "took", age = math.max(0, now_ms() - a.since) }))
+		end
+		return marks
+	elseif a.state == "waiting" then
+		return {
+			ui.node("badge", { key = "doing", text = "Waiting for you", tone = "warning", title = "omp asks you something" }),
+		}
+	end
+	return { ui.node("badge", { key = "doing", text = "Open", title = "Open in omp, idle" }) }
+end
+
+local function session_card(s: Session, id: string, selected: boolean, a: Activity?): Node
 	local glyph, code, text = split_title(s.title)
 	local head: { Span | string } = {}
 	if glyph then
@@ -1291,15 +1482,18 @@ local function session_card(s: Session, id: string, selected: boolean, held: boo
 		head = head,
 		meta = ago(s.updated),
 		selected = selected,
-		status = if held then "running" else nil,
 		grow = 1,
 		basis = 0,
-		actions = { click = "pick=" .. s.key, dblclick = "open=" .. s.key, menu = card_menu(s, held) },
+		actions = { click = "pick=" .. s.key, dblclick = "open=" .. s.key, menu = card_menu(s, a ~= nil) },
 	}
 	local kids: { Node } = {}
+	local marks = activity_marks(a)
 	if code then
-		table.insert(kids, ui.node("badge", { key = "code", text = code }))
-		props["end"] = id .. ".code"
+		table.insert(marks, ui.node("badge", { key = "code", text = code }))
+	end
+	if #marks > 0 then
+		table.insert(kids, ui.node("row", { key = "end", gap = "sm", align = "center" }, marks))
+		props["end"] = id .. ".end"
 	end
 	table.insert(kids, ui.node("text", {
 		key = "where",
@@ -1322,7 +1516,7 @@ local function session_card(s: Session, id: string, selected: boolean, held: boo
 end
 
 -- A session as one list row: title, folder and prompt, then when.
-local function session_item(s: Session, held: boolean): Node
+local function session_item(s: Session, a: Activity?): Node
 	local glyph, code, text = split_title(s.title)
 	local label: { Span | string } = {}
 	if glyph then
@@ -1341,8 +1535,13 @@ local function session_item(s: Session, held: boolean): Node
 		table.insert(detail, ui.span("   " .. s.prompt, "dim"))
 	end
 	local value: { Span | string } = {}
-	if held then
-		table.insert(value, ui.span("Running · ", "success"))
+	if a and a.state == "working" then
+		local took = if a.since then " " .. minutes(now_ms() - a.since) else ""
+		table.insert(value, ui.span("Working" .. took .. " · ", "pending"))
+	elseif a and a.state == "waiting" then
+		table.insert(value, ui.span("Waiting for you · ", "warning"))
+	elseif a then
+		table.insert(value, ui.span("Open · "))
 	end
 	table.insert(value, ui.span(ago(s.updated), "muted"))
 	return ui.node("item", {
@@ -1351,19 +1550,19 @@ local function session_item(s: Session, held: boolean): Node
 		detail = detail,
 		value = value,
 		icon = if s.provider ~= "" then "provider:" .. s.provider else "app-omp",
-		actions = { click = "pick=" .. s.key, dblclick = "open=" .. s.key, menu = card_menu(s, held) },
+		actions = { click = "pick=" .. s.key, dblclick = "open=" .. s.key, menu = card_menu(s, a ~= nil) },
 	})
 end
 
 -- A group's drawn sessions as rows of equal cards, the last row padded, so
 -- every column lines up.
-local function card_rows(g: Group, p: Plan, sel: string?, open: { [string]: boolean }): { Node }
+local function card_rows(g: Group, p: Plan, sel: string?, doing: { [string]: Activity }): { Node }
 	local rows: { Node } = {}
 	for first = 1, g.drawn, p.cols do
 		local cells: { Node } = {}
 		for i = first, math.min(first + p.cols - 1, g.drawn) do
 			local s = g.sessions[i]
-			table.insert(cells, session_card(s, p.ids[s.key], s.key == sel, is_held(s, open)))
+			table.insert(cells, session_card(s, p.ids[s.key], s.key == sel, doing[s.key]))
 		end
 		for pad = #cells + 1, p.cols do
 			table.insert(cells, ui.node("row", { key = "pad" .. pad, grow = 1, basis = 0 }))
@@ -1373,7 +1572,7 @@ local function card_rows(g: Group, p: Plan, sel: string?, open: { [string]: bool
 	return rows
 end
 
-local function session_list(g: Group, p: Plan, sel: string?, open: { [string]: boolean }): Node
+local function session_list(g: Group, p: Plan, sel: string?, doing: { [string]: Activity }): Node
 	local items: { Node } = {}
 	local selected: string? = nil
 	for i = 1, g.drawn do
@@ -1381,21 +1580,28 @@ local function session_list(g: Group, p: Plan, sel: string?, open: { [string]: b
 		if s.key == sel then
 			selected = p.ids[s.key]
 		end
-		table.insert(items, session_item(s, is_held(s, open)))
+		table.insert(items, session_item(s, doing[s.key]))
 	end
 	return ui.node("list", { key = "list", selected = selected }, items)
 end
 
-local function group_body(state: State, g: Group, p: Plan, sel: string?, open: { [string]: boolean }): { Node }
+local function group_body(state: State, g: Group, p: Plan, sel: string?, doing: { [string]: Activity }): { Node }
 	if state.view == "list" then
-		return { session_list(g, p, sel, open) }
+		return { session_list(g, p, sel, doing) }
 	end
-	return card_rows(g, p, sel, open)
+	return card_rows(g, p, sel, doing)
 end
+
+-- A workspace heading's counts of what omp does with its sessions.
+local COUNTS = {
+	{ state = "working", label = "working", tone = "pending" },
+	{ state = "waiting", label = "waiting", tone = "warning" },
+	{ state = "open", label = "open", tone = "muted" },
+}
 
 -- A group's heading: its name, its folder and counts; a workspace's also
 -- starts a session there or shows only it.
-local function group_head(g: Group, open: { [string]: boolean }): Node
+local function group_head(g: Group, doing: { [string]: Activity }): Node
 	local spans: { Span | string } = { ui.span(g.title or "", "strong") }
 	local cwd = g.cwd or ""
 	if cwd ~= "" then
@@ -1403,14 +1609,18 @@ local function group_head(g: Group, open: { [string]: boolean }): Node
 	end
 	table.insert(spans, ui.span("   " .. count(#g.sessions, "session"), "dim"))
 	if g.cwd then
-		local held = 0
+		local counts: { [string]: number } = {}
 		for _, s in g.sessions do
-			if is_held(s, open) then
-				held += 1
+			local a = doing[s.key]
+			if a then
+				counts[a.state] = (counts[a.state] or 0) + 1
 			end
 		end
-		if held > 0 then
-			table.insert(spans, ui.span(" · " .. held .. " running", "success"))
+		for _, c in COUNTS do
+			local n = counts[c.state]
+			if n then
+				table.insert(spans, ui.span(" · " .. n .. " " .. c.label, c.tone))
+			end
 		end
 	end
 	local kids: { Node } = { ui.node("text", { key = "title", grow = 1, wrap = "none", truncate = "end", spans = spans }) }
@@ -1433,22 +1643,22 @@ local function group_head(g: Group, open: { [string]: boolean }): Node
 	return ui.node("row", { key = "head", gap = "sm", align = "center" }, kids)
 end
 
-local function sessions_view(state: State, p: Plan, open: { [string]: boolean }): Node
+local function sessions_view(state: State, p: Plan, doing: { [string]: Activity }): Node
 	local current = chosen(state, p)
 	local sel = if current then current.key else nil
 	local kids: { Node } = {}
 	for _, g in p.groups do
 		if g.title == nil then
-			kids = group_body(state, g, p, sel, open)
+			kids = group_body(state, g, p, sel, doing)
 			break
 		end
 		local folded = state.folded[g.key] == true
 		if not folded and g.drawn == 0 then
 			break -- behind the pager
 		end
-		local body: { Node } = { group_head(g, open) }
+		local body: { Node } = { group_head(g, doing) }
 		if not folded then
-			for _, node in group_body(state, g, p, sel, open) do
+			for _, node in group_body(state, g, p, sel, doing) do
 				table.insert(body, node)
 			end
 		end
@@ -1545,15 +1755,24 @@ local function view(state: State, cx: BlockCx): BlockView
 			state.project = ALL
 		end
 	end
-	local open = on_screen()
-	local p = plan(state, cx, open)
+	local doing = activities()
+	local p = plan(state, cx, doing)
+	if state.view == "list" then
+		for _, s in p.order do
+			local a = doing[s.key]
+			if a and a.since then
+				tick_later()
+				break
+			end
+		end
+	end
 	local main: { Node } = { head_row() }
 	if #list > 0 then
 		table.insert(main, stats_strip(p.shown))
 	end
 	table.insert(main, toolbar(state))
 	if #p.shown > 0 then
-		table.insert(main, sessions_view(state, p, open))
+		table.insert(main, sessions_view(state, p, doing))
 		if p.total > #p.order then
 			table.insert(main, ui.node("pager", {
 				key = "more",
@@ -1587,7 +1806,7 @@ local function drop_word(s: string): string
 end
 
 local function open_selected(state: State, cx: BlockCx, how: string): boolean
-	local s = chosen(state, plan(state, cx, on_screen()))
+	local s = chosen(state, plan(state, cx, activities()))
 	if s == nil then
 		return false
 	end
@@ -1685,7 +1904,14 @@ local function event(state: State, ev: UiEvent, cx: BlockCx)
 		local act = ev.act
 		local s = find(if type(ev.value) == "string" then ev.value else nil)
 		if act == "wake" then
+			take_agents(ev.value)
 			refresh(false) -- the window half: the gallery got focus
+		elseif act == "agents" then
+			-- The window half: an omp pane started or ended a turn.
+			if take_agents(ev.value) then
+				render_all()
+				refresh_soon()
+			end
 		elseif act == "new" then
 			new_session(state, cx)
 		elseif act == "refresh" then

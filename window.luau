@@ -1,8 +1,9 @@
 --!strict
 -- omp-gallery, window half: the "Show omp sessions" command and its status
 -- line button, the gallery's tab at window start, a refresh whenever the
--- gallery gets focus, and the links the gallery block opens: resume a
--- session, or start a new one in a folder picked here.
+-- gallery gets focus, how this window's omp panes are doing (working, waiting
+-- or idle) whenever that changes, and the links the gallery block opens:
+-- resume a session, or start a new one in a folder picked here.
 
 local common = require("./common")
 
@@ -91,12 +92,32 @@ tern.on("window_start", function(cx: WindowCx)
 	start(cx, 1)
 end)
 
+-- Tells the gallery block in `pane` something (`act`), with how each omp pane
+-- of this window is doing (cx.agents:list() states by pane id, as JSON).
+local function tell(cx: WindowCx, pane: number, act: string)
+	-- Raises when the block has ended (its plugin failed to load): nobody to tell.
+	pcall(function()
+		local states: { [string]: string } = {}
+		for _, a in cx.agents:list() do
+			states[tostring(a.pane)] = a.state
+		end
+		cx.session:event(pane, { ev = "action", id = "main", act = act, value = tern.json.encode(states) })
+	end)
+end
+
 -- Coming back to the gallery picks up sessions that changed meanwhile.
 tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	local p = cx.session:pane(ev.pane)
 	if p and p.block == common.KIND then
-		-- Raises when the block has ended (its plugin failed to load): nothing to wake.
-		pcall(cx.session.event, cx.session, ev.pane, { ev = "action", id = "main", act = "wake" })
+		tell(cx, ev.pane, "wake")
+	end
+end)
+
+-- An omp pane started or ended a turn, or began waiting for an answer.
+tern.on("agent_state", function(_ev: AgentStateEvent, cx: WindowCx)
+	local pane = gallery(cx)
+	if pane then
+		tell(cx, pane, "agents")
 	end
 end)
 

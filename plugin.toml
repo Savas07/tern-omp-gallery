@@ -1,8 +1,8 @@
 schema = 1
 id = "omp-gallery"
 name = "omp sessions"
-version = "0.4.0"
-description = "A gallery of every omp session on this machine: cards or a list, grouped by workspace or last activity; search, filter, resume one in a new tab, or start a new one in any folder."
+version = "0.5.0"
+description = "A gallery of every omp session on this machine: cards or a list, grouped by workspace or last activity, with the ones omp is working on (and for how long) told apart from the ones just open; search, filter, resume one in a new tab, or start a new one in any folder."
 icon = "history"
 host = "host.luau"
 window = "window.luau"
