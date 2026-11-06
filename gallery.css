@@ -12,25 +12,22 @@
 [data-role='omp-gallery.tab-purple'] { --omp-tab: light-dark(#af52de, #bf5af2); }
 [data-role='omp-gallery.tab-pink'] { --omp-tab: light-dark(#ff2d55, #ff375f); }
 
-/* A wash of the color over the card's own background, a ring and a bar. */
+/* A wash of the color over the card's own background, and a ring. */
 .sf-main[data-surface='plugin.omp-gallery.gallery'] .sf-card[data-role^='omp-gallery.tab-'] {
 	background-image: linear-gradient(rgb(from var(--omp-tab) r g b / 8%), rgb(from var(--omp-tab) r g b / 8%));
 	box-shadow:
-		inset 3px 0 0 var(--omp-tab),
-		inset 0 0 0 1px rgb(from var(--omp-tab) r g b / 45%),
+		inset 0 0 0 1px rgb(from var(--omp-tab) r g b / 55%),
 		0 1px 2px rgba(0, 0, 0, 0.03);
 }
 
-/* Selected keeps Tern's accent ring; the bar stays. */
+/* Selected keeps Tern's accent ring over the wash. */
 .sf-main[data-surface='plugin.omp-gallery.gallery'] .sf-card.selected[data-role^='omp-gallery.tab-'] {
 	box-shadow:
-		inset 3px 0 0 var(--omp-tab),
 		inset 0 0 0 1px var(--accent),
 		0 0 0 3px rgb(from var(--accent) r g b / 16%);
 }
 
-/* List rows: the bar and the wash; the selected row keeps the accent. */
+/* List rows: the wash; the selected row keeps the accent. */
 .sf-main[data-surface='plugin.omp-gallery.gallery'] .sf-item[data-role^='omp-gallery.tab-']:not(.sel) {
 	background-image: linear-gradient(rgb(from var(--omp-tab) r g b / 8%), rgb(from var(--omp-tab) r g b / 8%));
-	box-shadow: inset 3px 0 0 var(--omp-tab);
 }
