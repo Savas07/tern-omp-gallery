@@ -94,8 +94,9 @@ end)
 -- Coming back to the gallery picks up sessions that changed meanwhile.
 tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	local p = cx.session:pane(ev.pane)
-	if p and p.block == common.KIND and p.exited == nil then
-		cx.session:event(ev.pane, { ev = "action", id = "main", act = "wake" })
+	if p and p.block == common.KIND then
+		-- Raises when the block has ended (its plugin failed to load): nothing to wake.
+		pcall(cx.session.event, cx.session, ev.pane, { ev = "action", id = "main", act = "wake" })
 	end
 end)
 
