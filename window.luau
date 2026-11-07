@@ -321,9 +321,41 @@ local function type_path(cx: WindowCx, dir: string, recent: { string })
 	end)
 end
 
+-- Makes a folder (a name in `dir`, or a path) and starts omp in it.
+local function new_folder(cx: WindowCx, dir: string, recent: { string })
+	cx:prompt({
+		placeholder = "New folder in " .. common.tilde(dir) .. " (a name, or a path)",
+		icon = "folder-plus",
+		action = "create",
+	}):next(function(typed: string?, _err: string?, later: WindowCx?)
+		if typed == nil or later == nil then
+			return
+		end
+		if string.match(typed, "^%s*$") then
+			browse(later, dir, recent)
+			return
+		end
+		local path = resolve(dir, typed)
+		if tern.fs.exists(path) then
+			later:toast("error", if is_dir(path) then "That folder exists already" else "A file has that name", common.tilde(path))
+			browse(later, if is_dir(path) then path else dir, recent)
+			return
+		end
+		local ok, err = pcall(function()
+			tern.fs.mkdir(path)
+		end)
+		if not ok then
+			later:toast("error", "Couldn't make the folder", tostring(err))
+			browse(later, dir, recent)
+			return
+		end
+		start_omp(later, path)
+	end)
+end
+
 -- The new session picker: start omp in `dir`, start it in a recent project,
--- or go to another folder (a subfolder, up, home or a typed path) and pick
--- again there.
+-- make a new folder and start it there, or go to another folder (a
+-- subfolder, up, home or a typed path) and pick again there.
 browse = function(cx: WindowCx, dir: string, recent: { string })
 	dir = common.slashes(dir)
 	local here = common.tilde(dir)
@@ -336,6 +368,7 @@ browse = function(cx: WindowCx, dir: string, recent: { string })
 	if dir ~= HOME and HOME ~= "" then
 		table.insert(items, { label = "Home", detail = "~", icon = "folder", group = here, go = "open", path = HOME })
 	end
+	table.insert(items, { label = "New folder…", detail = "start omp in it", icon = "folder-plus", group = here, go = "mkdir" })
 	table.insert(items, { label = "Type a path…", icon = "folder-go", group = here, go = "type" })
 	for _, path in recent do
 		if path ~= dir and is_dir(path) then
@@ -366,6 +399,8 @@ browse = function(cx: WindowCx, dir: string, recent: { string })
 			start_omp(later, item.path)
 		elseif item.go == "type" then
 			type_path(later, dir, recent)
+		elseif item.go == "mkdir" then
+			new_folder(later, dir, recent)
 		else
 			browse(later, item.path, recent)
 		end
